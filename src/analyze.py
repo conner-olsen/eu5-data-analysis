@@ -73,7 +73,9 @@ def load_data():
         prices = json.load(f)
     with open(DATA_DIR / "combined_arms.json") as f:
         combined_arms = json.load(f)
-    return land_units, categories, age_progression, prices, combined_arms
+    with open(DATA_DIR / "goods_demands.json") as f:
+        goods_demands = json.load(f)
+    return land_units, categories, age_progression, prices, combined_arms, goods_demands
 
 
 def style_header_row(ws, row, num_cols):
@@ -1064,12 +1066,167 @@ def build_optimal_composition_gold(wb, land_units, categories, combined_arms, pr
     ws.freeze_panes = "A6"
 
 
+def build_goods_demands(wb, land_units, categories, goods_demands):
+    """Sheet: Resource requirements per buildable unit per age."""
+    ws = wb.create_sheet("Goods Demands")
+
+    ws.cell(row=1, column=1, value="Unit Goods Demands (Construction & Maintenance)").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Scraped from goods_demand/army_demands.txt. "
+                  "Quantities are per unit at max_strength.").font = SUBTITLE_FONT
+
+    # Collect all goods that appear across all demands
+    all_goods = set()
+    for goods in goods_demands.values():
+        all_goods.update(goods.keys())
+    all_goods = sorted(all_goods)
+
+    units = [
+        u for u in land_units
+        if u.get("buildable", True)
+        and not u.get("levy", False)
+        and not u["name"].startswith("a_age_")
+    ]
+
+    headers = ["Age", "Unit", "Category", "Light", "Demand Ref"] + all_goods
+
+    row = 4
+    for table_type, demand_field in [
+        ("Construction", "construction_demand"),
+        ("Maintenance", "maintenance_demand"),
+    ]:
+        ws.cell(row=row, column=1, value=f"{table_type} Demands").font = Font(bold=True, size=13)
+        row += 1
+
+        for i, h in enumerate(headers, 1):
+            ws.cell(row=row, column=i, value=h)
+        style_header_row(ws, row, len(headers))
+        header_row = row
+        row += 1
+
+        for age in AGE_ORDER:
+            age_units = [u for u in units if u.get("age") == age]
+            if not age_units:
+                continue
+
+            for u in sorted(age_units, key=lambda x: (x["category"], x["name"])):
+                cat_label = CAT_LABELS.get(u["category"], u["category"])
+                demand_ref = u.get(demand_field, "") or categories.get(u["category"], {}).get(demand_field, "")
+                goods = goods_demands.get(demand_ref, {})
+
+                values = [
+                    AGE_LABELS.get(u.get("age", ""), "?"),
+                    u["name"],
+                    cat_label,
+                    "Yes" if u.get("light") else "",
+                    demand_ref,
+                ] + [goods.get(g, "") for g in all_goods]
+
+                for j, v in enumerate(values, 1):
+                    cell = ws.cell(row=row, column=j, value=v)
+                    cell.border = THIN_BORDER
+                    if isinstance(v, float):
+                        cell.number_format = NUM_FMT_3
+                    cat_fill = CAT_FILLS.get(cat_label)
+                    if cat_fill:
+                        cell.fill = cat_fill
+
+                row += 1
+            row += 1  # gap between ages
+
+        row += 1  # gap between tables
+
+    auto_width(ws, min_width=6, max_width=20)
+    ws.freeze_panes = f"F{6}"
+
+
+def build_goods_demands_generic(wb, land_units, categories, goods_demands):
+    """Sheet: Goods demands for generic (non-special) infantry/cav/art/aux only."""
+    ws = wb.create_sheet("Goods (Generic)")
+
+    ws.cell(row=1, column=1, value="Generic Unit Goods Demands").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Standard upgrade-chain units only (no specials). "
+                  "One heavy + one light per category per age.").font = SUBTITLE_FONT
+
+    best_units = get_best_generic_units(land_units, categories)
+
+    # Collect only goods that these units actually use
+    relevant_goods = set()
+    for age_types in best_units.values():
+        for t in age_types:
+            unit_name = t["unit_name"]
+            if unit_name == "-":
+                continue
+            u = next((u for u in land_units if u["name"] == unit_name), None)
+            if not u:
+                continue
+            for field in ["construction_demand", "maintenance_demand"]:
+                ref = u.get(field, "")
+                for g in goods_demands.get(ref, {}):
+                    relevant_goods.add(g)
+    relevant_goods = sorted(relevant_goods)
+
+    headers = ["Age", "Type", "Unit", "Demand Ref"] + relevant_goods
+
+    row = 4
+    for table_type, demand_field in [
+        ("Construction", "construction_demand"),
+        ("Maintenance", "maintenance_demand"),
+    ]:
+        ws.cell(row=row, column=1, value=f"{table_type} Demands").font = Font(bold=True, size=13)
+        row += 1
+
+        for i, h in enumerate(headers, 1):
+            ws.cell(row=row, column=i, value=h)
+        style_header_row(ws, row, len(headers))
+        row += 1
+
+        for age in AGE_ORDER:
+            types = best_units[age]
+            for t in types:
+                unit_name = t["unit_name"]
+                if unit_name == "-":
+                    continue
+                u = next((u for u in land_units if u["name"] == unit_name), None)
+                if not u:
+                    continue
+
+                cat_label = CAT_LABELS.get(u["category"], u["category"])
+                demand_ref = u.get(demand_field, "") or categories.get(u["category"], {}).get(demand_field, "")
+                goods = goods_demands.get(demand_ref, {})
+
+                values = [
+                    AGE_LABELS.get(age, "?"),
+                    t["type_label"],
+                    unit_name,
+                    demand_ref,
+                ] + [goods.get(g, "") for g in relevant_goods]
+
+                for j, v in enumerate(values, 1):
+                    cell = ws.cell(row=row, column=j, value=v)
+                    cell.border = THIN_BORDER
+                    if isinstance(v, float):
+                        cell.number_format = NUM_FMT_3
+                    cat_fill = CAT_FILLS.get(cat_label)
+                    if cat_fill:
+                        cell.fill = cat_fill
+
+                row += 1
+            row += 1  # gap between ages
+
+        row += 1  # gap between tables
+
+    auto_width(ws, min_width=6, max_width=20)
+    ws.freeze_panes = "E6"
+
+
 def main():
     if not DATA_DIR.exists():
         print("No data/ directory found. Run scraper.py first.")
         return
 
-    land_units, categories, age_progression, prices, combined_arms = load_data()
+    land_units, categories, age_progression, prices, combined_arms, goods_demands = load_data()
 
     wb = Workbook()
 
@@ -1084,6 +1241,12 @@ def main():
 
     print("Building Optimal Composition (Gold) sheet...")
     build_optimal_composition_gold(wb, land_units, categories, combined_arms, prices)
+
+    print("Building Goods Demands sheet...")
+    build_goods_demands(wb, land_units, categories, goods_demands)
+
+    print("Building Goods (Generic) sheet...")
+    build_goods_demands_generic(wb, land_units, categories, goods_demands)
 
     print("Building Upgrade Chains sheet...")
     build_upgrade_chains(wb, land_units)

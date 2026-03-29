@@ -72,6 +72,9 @@ def scrape_categories() -> dict:
             cat["ai_weight"] = data["ai_weight"]
         if "startup_amount" in data:
             cat["startup_amount"] = data["startup_amount"]
+        for demand in ["maintenance_demand", "construction_demand"]:
+            if demand in data:
+                cat[demand] = data[demand]
         categories[name] = cat
     return categories
 
@@ -287,6 +290,23 @@ def scrape_unit_prices() -> dict:
     return prices
 
 
+def scrape_goods_demands() -> dict:
+    """Scrape unit goods demands from goods_demand/army_demands.txt.
+
+    Returns dict keyed by demand name (e.g., "infantry_construction"),
+    with goods quantities (excluding the "category" field).
+    """
+    raw = parse_directory(COMMON_DIR / "goods_demand")
+    demands = {}
+    for name, data in raw.items():
+        if not isinstance(data, dict):
+            continue
+        goods = {k: v for k, v in data.items() if k != "category" and isinstance(v, (int, float))}
+        if goods:
+            demands[name] = goods
+    return demands
+
+
 def scrape_combined_arms() -> dict:
     """Scrape combined arms defines from auto_modifiers/country.txt."""
     raw = parse_directory(COMMON_DIR / "auto_modifiers")
@@ -306,6 +326,9 @@ def main():
 
     print("Scraping unit prices...")
     prices = scrape_unit_prices()
+
+    print("Scraping goods demands...")
+    goods_demands = scrape_goods_demands()
 
     print("Scraping combined arms defines...")
     combined_arms = scrape_combined_arms()
@@ -339,6 +362,10 @@ def main():
     age_progression = build_age_progression(units)
 
     # Save outputs
+    with open(OUTPUT_DIR / "goods_demands.json", "w") as f:
+        json.dump(goods_demands, f, indent=2)
+    print(f"  Wrote goods_demands.json ({len(goods_demands)} demand types)")
+
     with open(OUTPUT_DIR / "combined_arms.json", "w") as f:
         json.dump(combined_arms, f, indent=2)
     print(f"  Wrote combined_arms.json ({combined_arms})")
