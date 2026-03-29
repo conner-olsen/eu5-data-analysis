@@ -75,7 +75,19 @@ def load_data():
         combined_arms = json.load(f)
     with open(DATA_DIR / "goods_demands.json") as f:
         goods_demands = json.load(f)
-    return land_units, categories, age_progression, prices, combined_arms, goods_demands
+    with open(DATA_DIR / "production_recipes.json") as f:
+        production_recipes = json.load(f)
+    with open(DATA_DIR / "localizations.json") as f:
+        localizations = json.load(f)
+    return land_units, categories, age_progression, prices, combined_arms, goods_demands, production_recipes, localizations
+
+
+LOC = {}  # populated in main(), used by loc() helper
+
+
+def loc(internal_name: str) -> str:
+    """Get display name for a unit, falling back to internal name."""
+    return LOC.get(internal_name, internal_name)
 
 
 def style_header_row(ws, row, num_cols):
@@ -139,6 +151,8 @@ def calc_maintenance(strength, category, prices):
 
 
 BEST_FONT = Font(bold=True)
+BEST_OVERALL_FONT = Font(bold=True, color="FF0000")
+BEST_CAT_FONT = Font(color="0070C0")  # blue
 
 
 def highlight_best_in_age(ws, data_rows, header_row, col_indices):
@@ -162,6 +176,53 @@ def highlight_best_in_age(ws, data_rows, header_row, col_indices):
                     best_row = row_num
             if best_row is not None and best_val is not None and best_val > 0:
                 ws.cell(row=best_row, column=col).font = BEST_FONT
+
+
+def highlight_best_in_age_by_cat(ws, data_rows, col_indices):
+    """Highlight best overall (green) and best per category (blue) per age.
+
+    data_rows: list of (excel_row_number, age_key, category, {col_index: value})
+    """
+    by_age = {}
+    for row_num, age, cat, vals in data_rows:
+        by_age.setdefault(age, []).append((row_num, cat, vals))
+
+    for age, rows in by_age.items():
+        for col in col_indices:
+            # Find overall best
+            best_val = None
+            best_row = None
+            # Find best per category
+            cat_best = {}  # cat -> (row, val)
+            for row_num, cat, vals in rows:
+                v = vals.get(col, 0)
+                if v is not None and v > 0:
+                    if best_val is None or v > best_val:
+                        best_val = v
+                        best_row = row_num
+                    cb = cat_best.get(cat)
+                    if cb is None or v > cb[1]:
+                        cat_best[cat] = (row_num, v)
+
+            # Apply overall best = green
+            if best_row is not None:
+                ws.cell(row=best_row, column=col).font = BEST_OVERALL_FONT
+
+            # Apply best per category = blue (skip the overall winner's category
+            # and categories with only one unit)
+            if best_row is not None:
+                winner_cat = None
+                for row_num, cat, vals in rows:
+                    if row_num == best_row:
+                        winner_cat = cat
+                        break
+                # Count units per category
+                cat_counts = {}
+                for row_num, cat, vals in rows:
+                    cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                for cat, (cr, cv) in cat_best.items():
+                    if cat != winner_cat and cv > 0 and cat_counts.get(cat, 0) > 1:
+                        ws.cell(row=cr, column=col).font = BEST_CAT_FONT
 
 
 # ---------------------------------------------------------------------------
@@ -259,19 +320,21 @@ def build_army_meta(wb, age_data, categories, prices):
 
 def build_buildable_units(wb, land_units, categories, prices):
     """Sheet 2: All buildable units with detailed stats and power calculations."""
-    ws = wb.create_sheet("Buildable Units")
+    ws = wb.create_sheet("Unique Units")
 
-    ws.cell(row=1, column=1, value="All Buildable Units by Age").font = TITLE_FONT
-    ws.cell(row=2, column=1, value="Gold cells = best in age for that column").font = Font(italic=True)
+    ws.cell(row=1, column=1, value="Unique Units by Age").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Green = best overall in age, Blue = best in category").font = Font(italic=True)
 
     headers = [
-        "Age", "Unit", "Category", "Light", "Special",
+        "Age", "Category", "Unit",
+        "Flank Power", "Center Power", "Flank P/Gold", "Center P/Gold",
+        "Light", "Special",
         "Strength", "Combat Power", "Combat Speed", "Initiative",
         "Flanking", "Secure Flanks", "Damage Taken",
         "Str Dmg Taken", "Morale Dmg Taken",
         "Str Dmg Done", "Morale Dmg Done",
-        "Damage", "Flank Power", "Center Power",
-        "Build Cost", "Flank P/Gold", "Center P/Gold",
+        "Damage", "Build Cost",
         "Upgrades To",
     ]
     header_row = 4
@@ -279,8 +342,8 @@ def build_buildable_units(wb, land_units, categories, prices):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    # Highlight columns: FP=18, CP=19, FP/G=21, CP/G=22
-    HIGHLIGHT_COLS = [18, 19, 21, 22]
+    # Highlight columns: FP=4, CP=5, FP/G=6, CP/G=7
+    HIGHLIGHT_COLS = [4, 5, 6, 7]
 
     units = [
         u for u in land_units
@@ -321,8 +384,9 @@ def build_buildable_units(wb, land_units, categories, prices):
 
             values = [
                 AGE_LABELS.get(u.get("age", ""), "?"),
-                u["name"],
                 cat_label,
+                loc(u["name"]),
+                fp, center, fp_gold, cp_gold,
                 "Yes" if u.get("light") else "",
                 "Yes" if u.get("is_special") else "",
                 strength, cp, cs,
@@ -332,8 +396,7 @@ def build_buildable_units(wb, land_units, categories, prices):
                 safe_num(u.get("morale_damage_taken", 0)),
                 safe_num(u.get("strength_damage_done", 0)),
                 safe_num(u.get("morale_damage_done", 0)),
-                damage, fp, center,
-                build_cost, fp_gold, cp_gold,
+                damage, build_cost,
                 u.get("upgrades_to", ""),
             ]
             for i, v in enumerate(values, 1):
@@ -345,12 +408,12 @@ def build_buildable_units(wb, land_units, categories, prices):
                 if cat_fill:
                     cell.fill = cat_fill
 
-            tracked_rows.append((row, age, {c: values[c - 1] for c in HIGHLIGHT_COLS}))
+            tracked_rows.append((row, age, cat_label, {c: values[c - 1] for c in HIGHLIGHT_COLS}))
             row += 1
 
         row += 1  # gap between ages
 
-    highlight_best_in_age(ws, tracked_rows, header_row, HIGHLIGHT_COLS)
+    highlight_best_in_age_by_cat(ws, tracked_rows, HIGHLIGHT_COLS)
     auto_width(ws)
     ws.freeze_panes = f"A{header_row + 1}"
 
@@ -398,7 +461,7 @@ def build_upgrade_chains(wb, land_units):
             if age in AGE_ORDER:
                 col = AGE_ORDER.index(age) + 3  # offset for Category, Type columns
                 ep = round(current.get("max_strength", 0) * current.get("combat_power", 0), 2)
-                cell = ws.cell(row=row, column=col, value=f"{current['name']} (EP:{ep})")
+                cell = ws.cell(row=row, column=col, value=f"{loc(current['name'])} (EP:{ep})")
                 cell.border = THIN_BORDER
                 cat_fill = CAT_FILLS.get(cat_label)
                 if cat_fill:
@@ -464,7 +527,7 @@ def build_special_units(wb, land_units, categories):
 
         values = [
             AGE_LABELS.get(u.get("age", ""), "?"),
-            u["name"], cat_label,
+            loc(u["name"]), cat_label,
             "Yes" if u.get("light") else "",
             strength, cp, round(damage, 2),
             safe_num(u.get("combat_speed", cat_data.get("combat_speed", 1))),
@@ -608,7 +671,7 @@ def build_light_vs_heavy(wb, land_units, categories):
 
                 values = [
                     AGE_LABELS[age], cat_label,
-                    u["name"],
+                    loc(u["name"]),
                     "Light" if u.get("light") else "Heavy",
                     strength, cp, round(damage, 2),
                     safe_num(u.get("combat_speed", cat_data.get("combat_speed", 1))),
@@ -871,10 +934,10 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
 
         # Column headers
         headers = [
-            "Type", "Unit", "Strength", "CombatPower",
-            "Str Dmg Done", "Str Dmg Taken", "Initiative",
+            "Type", "Unit", "Optimal %", "Positional Power",
             "Flank Power", "Center Power",
-            "Optimal %", "Positional Power",
+            "Strength", "CombatPower",
+            "Str Dmg Done", "Str Dmg Taken", "Initiative",
         ]
         for i, h in enumerate(headers, 1):
             ws.cell(row=row, column=i, value=h)
@@ -889,10 +952,8 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
         )
 
         # Compute per-type positional contribution
-        # (replicating the placement logic for display)
         center_remaining = CENTER_RATIO
         type_positional = [0.0] * len(types)
-        placement = []
         for idx, pct, fp, cp, adv in sorted(
             [(i, pcts[i], flank_powers[i], center_powers[i], center_powers[i] - flank_powers[i])
              for i in range(len(types)) if pcts[i] > 1e-9],
@@ -902,50 +963,48 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
             in_flank = pct - in_center
             center_remaining -= in_center
             type_positional[idx] = in_center * cp + in_flank * fp
-            placement.append((idx, in_center, in_flank))
 
         for i, t in enumerate(types):
             pct = pcts[i]
             values = [
-                t["type_label"], t["unit_name"],
+                t["type_label"], loc(t["unit_name"]),
+                pct, type_positional[i],
+                t["flank_power"], t["center_power"],
                 t["strength"], t["combat_power"],
                 t["str_dmg_done"], t["str_dmg_taken"], t["initiative"],
-                t["flank_power"], t["center_power"],
-                pct,
-                type_positional[i],
             ]
             for j, v in enumerate(values, 1):
                 cell = ws.cell(row=row, column=j, value=v)
                 cell.border = THIN_BORDER
                 if isinstance(v, float):
                     cell.number_format = NUM_FMT_2
-                if j == 10:
+                if j == 3:  # Optimal %
                     cell.number_format = "0%"
             if pct >= combined_arms["min_percent"] - 1e-9:
                 ws.cell(row=row, column=1).font = BEST_FONT
-                ws.cell(row=row, column=10).font = BEST_FONT
+                ws.cell(row=row, column=3).font = BEST_FONT
             row += 1
 
         # Summary rows
         base_power = calc_positional_power(pcts, flank_powers, center_powers)
 
         ws.cell(row=row, column=1, value="Base Power (no bonus)").font = Font(bold=True)
-        ws.cell(row=row, column=11, value=base_power).number_format = NUM_FMT_2
+        ws.cell(row=row, column=4, value=base_power).number_format = NUM_FMT_2
         ws.cell(row=row, column=1).border = THIN_BORDER
-        ws.cell(row=row, column=11).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
         row += 1
 
         ws.cell(row=row, column=1, value=f"Combined Arms Bonus ({nq} types)").font = Font(bold=True)
-        ws.cell(row=row, column=11, value=bonus).number_format = "0.0%"
+        ws.cell(row=row, column=4, value=bonus).number_format = "0.0%"
         ws.cell(row=row, column=1).border = THIN_BORDER
-        ws.cell(row=row, column=11).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
         row += 1
 
         ws.cell(row=row, column=1, value="Total Power (with bonus)").font = Font(bold=True, size=12)
-        ws.cell(row=row, column=11, value=total).number_format = NUM_FMT_2
-        ws.cell(row=row, column=11).font = Font(bold=True, size=12)
+        ws.cell(row=row, column=4, value=total).number_format = NUM_FMT_2
+        ws.cell(row=row, column=4).font = Font(bold=True, size=12)
         ws.cell(row=row, column=1).border = THIN_BORDER
-        ws.cell(row=row, column=11).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
         row += 2
 
     auto_width(ws, max_width=35)
@@ -979,10 +1038,10 @@ def build_optimal_composition_gold(wb, land_units, categories, combined_arms, pr
         row += 1
 
         headers = [
-            "Type", "Unit", "Strength", "CombatPower",
-            "Str Dmg Done", "Str Dmg Taken", "Initiative",
+            "Type", "Unit", "Optimal %", "Positional P/Gold",
             "Flank P/Gold", "Center P/Gold",
-            "Optimal %", "Positional P/Gold",
+            "Strength", "CombatPower",
+            "Str Dmg Done", "Str Dmg Taken", "Initiative",
         ]
         for i, h in enumerate(headers, 1):
             ws.cell(row=row, column=i, value=h)
@@ -1022,48 +1081,183 @@ def build_optimal_composition_gold(wb, land_units, categories, combined_arms, pr
         for i, t in enumerate(types):
             pct = pcts[i]
             values = [
-                t["type_label"], t["unit_name"],
+                t["type_label"], loc(t["unit_name"]),
+                pct, type_positional[i],
+                flank_pg[i], center_pg[i],
                 t["strength"], t["combat_power"],
                 t["str_dmg_done"], t["str_dmg_taken"], t["initiative"],
-                flank_pg[i], center_pg[i],
-                pct,
-                type_positional[i],
             ]
             for j, v in enumerate(values, 1):
                 cell = ws.cell(row=row, column=j, value=v)
                 cell.border = THIN_BORDER
                 if isinstance(v, float):
                     cell.number_format = NUM_FMT_2
-                if j == 10:
+                if j == 3:
                     cell.number_format = "0%"
             if pct >= combined_arms["min_percent"] - 1e-9:
                 ws.cell(row=row, column=1).font = BEST_FONT
-                ws.cell(row=row, column=10).font = BEST_FONT
+                ws.cell(row=row, column=3).font = BEST_FONT
             row += 1
 
         base_power = calc_positional_power(pcts, flank_pg, center_pg)
 
         ws.cell(row=row, column=1, value="Base P/Gold (no bonus)").font = Font(bold=True)
-        ws.cell(row=row, column=11, value=base_power).number_format = NUM_FMT_2
+        ws.cell(row=row, column=4, value=base_power).number_format = NUM_FMT_2
         ws.cell(row=row, column=1).border = THIN_BORDER
-        ws.cell(row=row, column=11).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
         row += 1
 
         ws.cell(row=row, column=1, value=f"Combined Arms Bonus ({nq} types)").font = Font(bold=True)
-        ws.cell(row=row, column=11, value=bonus).number_format = "0.0%"
+        ws.cell(row=row, column=4, value=bonus).number_format = "0.0%"
         ws.cell(row=row, column=1).border = THIN_BORDER
-        ws.cell(row=row, column=11).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
         row += 1
 
         ws.cell(row=row, column=1, value="Total P/Gold (with bonus)").font = Font(bold=True, size=12)
-        ws.cell(row=row, column=11, value=total).number_format = NUM_FMT_2
-        ws.cell(row=row, column=11).font = Font(bold=True, size=12)
+        ws.cell(row=row, column=4, value=total).number_format = NUM_FMT_2
+        ws.cell(row=row, column=4).font = Font(bold=True, size=12)
         ws.cell(row=row, column=1).border = THIN_BORDER
-        ws.cell(row=row, column=11).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
         row += 2
 
     auto_width(ws, max_width=35)
     ws.freeze_panes = "A6"
+
+
+def calc_unit_iron(unit, categories, goods_demands, production_recipes):
+    """Get total iron cost for a unit by resolving its construction demand."""
+    ref = (unit.get("construction_demand", "")
+           or categories.get(unit["category"], {}).get("construction_demand", ""))
+    goods = goods_demands.get(ref, {})
+    if not goods:
+        return 0
+    raw = resolve_raw_materials(goods, production_recipes)
+    return raw.get("iron", 0)
+
+
+def build_optimal_composition_iron(wb, land_units, categories, combined_arms,
+                                    goods_demands, production_recipes):
+    """Sheet: Optimal army composition per age by power-per-iron."""
+    ws = wb.create_sheet("Optimal Comp (Iron)")
+
+    ws.cell(row=1, column=1, value="Optimal Army Composition (Power per Iron)").font = TITLE_FONT
+
+    ca = combined_arms
+    ws.cell(row=2, column=1,
+            value=f"Scraped: bonus/type={ca['bonus_per_type']:.1%}, "
+                  f"min threshold={ca['min_percent']:.0%}, "
+                  f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
+    ws.cell(row=3, column=1,
+            value="Positional placement: 33% center / 67% flanks. "
+                  "Optimizes power/iron (resolved via workshop recipes).").font = Font(italic=True)
+
+    best_units = get_best_generic_units(land_units, categories)
+
+    row = 5
+    for age in AGE_ORDER:
+        types = best_units[age]
+
+        ws.cell(row=row, column=1, value=AGE_LABELS[age]).font = Font(bold=True, size=13)
+        row += 1
+
+        headers = [
+            "Type", "Unit", "Optimal %", "Positional P/Iron",
+            "Iron Cost", "Flank P/Iron", "Center P/Iron",
+            "Flank Power", "Center Power",
+            "Strength", "CombatPower",
+            "Str Dmg Done", "Str Dmg Taken", "Initiative",
+        ]
+        for i, h in enumerate(headers, 1):
+            ws.cell(row=row, column=i, value=h)
+        style_header_row(ws, row, len(headers))
+        row += 1
+
+        # Compute power-per-iron for each type
+        flank_pi = []
+        center_pi = []
+        iron_costs = []
+        for t in types:
+            if t["unit_name"] == "-":
+                flank_pi.append(0)
+                center_pi.append(0)
+                iron_costs.append(0)
+                continue
+            u = next((u for u in land_units if u["name"] == t["unit_name"]), None)
+            iron = calc_unit_iron(u, categories, goods_demands, production_recipes) if u else 0
+            iron_costs.append(iron)
+            if iron > 0:
+                flank_pi.append(t["flank_power"] / iron)
+                center_pi.append(t["center_power"] / iron)
+            else:
+                flank_pi.append(t["flank_power"] * 1000 if t["flank_power"] > 0 else 0)
+                center_pi.append(t["center_power"] * 1000 if t["center_power"] > 0 else 0)
+
+        pcts, total, bonus, nq = optimize_composition(
+            flank_pi, center_pi, combined_arms
+        )
+
+        # Per-type positional contribution
+        center_remaining = CENTER_RATIO
+        type_positional = [0.0] * len(types)
+        for idx, pct, fpi, cpi, adv in sorted(
+            [(i, pcts[i], flank_pi[i], center_pi[i], center_pi[i] - flank_pi[i])
+             for i in range(len(types)) if pcts[i] > 1e-9],
+            key=lambda x: x[4], reverse=True,
+        ):
+            in_center = min(pct, center_remaining)
+            in_flank = pct - in_center
+            center_remaining -= in_center
+            type_positional[idx] = in_center * cpi + in_flank * fpi
+
+        for i, t in enumerate(types):
+            pct = pcts[i]
+            values = [
+                t["type_label"], loc(t["unit_name"]),
+                pct, type_positional[i],
+                iron_costs[i],
+                flank_pi[i] if iron_costs[i] > 0 else "",
+                center_pi[i] if iron_costs[i] > 0 else "",
+                t["flank_power"], t["center_power"],
+                t["strength"], t["combat_power"],
+                t["str_dmg_done"], t["str_dmg_taken"], t["initiative"],
+            ]
+            for j, v in enumerate(values, 1):
+                cell = ws.cell(row=row, column=j, value=v)
+                cell.border = THIN_BORDER
+                if isinstance(v, float):
+                    cell.number_format = NUM_FMT_2
+                if j == 3:  # optimal %
+                    cell.number_format = "0%"
+                if j == 5:  # iron cost
+                    cell.number_format = NUM_FMT_3
+            if pct >= combined_arms["min_percent"] - 1e-9:
+                ws.cell(row=row, column=1).font = BEST_FONT
+                ws.cell(row=row, column=3).font = BEST_FONT
+            row += 1
+
+        base_power = calc_positional_power(pcts, flank_pi, center_pi)
+
+        ws.cell(row=row, column=1, value="Base P/Iron (no bonus)").font = Font(bold=True)
+        ws.cell(row=row, column=4, value=base_power).number_format = NUM_FMT_2
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
+        row += 1
+
+        ws.cell(row=row, column=1, value=f"Combined Arms Bonus ({nq} types)").font = Font(bold=True)
+        ws.cell(row=row, column=4, value=bonus).number_format = "0.0%"
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
+        row += 1
+
+        ws.cell(row=row, column=1, value="Total P/Iron (with bonus)").font = Font(bold=True, size=12)
+        ws.cell(row=row, column=4, value=total).number_format = NUM_FMT_2
+        ws.cell(row=row, column=4).font = Font(bold=True, size=12)
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=4).border = THIN_BORDER
+        row += 2
+
+    auto_width(ws, max_width=35)
+    ws.freeze_panes = "A5"
 
 
 def build_goods_demands(wb, land_units, categories, goods_demands):
@@ -1116,7 +1310,7 @@ def build_goods_demands(wb, land_units, categories, goods_demands):
 
                 values = [
                     AGE_LABELS.get(u.get("age", ""), "?"),
-                    u["name"],
+                    loc(u["name"]),
                     cat_label,
                     "Yes" if u.get("light") else "",
                     demand_ref,
@@ -1140,14 +1334,14 @@ def build_goods_demands(wb, land_units, categories, goods_demands):
     ws.freeze_panes = f"F{6}"
 
 
-def build_goods_demands_generic(wb, land_units, categories, goods_demands):
+def build_goods_demands_generic(wb, land_units, categories, goods_demands, production_recipes):
     """Sheet: Goods demands for generic (non-special) infantry/cav/art/aux only."""
     ws = wb.create_sheet("Goods (Generic)")
 
     ws.cell(row=1, column=1, value="Generic Unit Goods Demands").font = TITLE_FONT
     ws.cell(row=2, column=1,
             value="Standard upgrade-chain units only (no specials). "
-                  "One heavy + one light per category per age.").font = SUBTITLE_FONT
+                  "iron (total) = resolved from produced goods via workshop recipes.").font = SUBTITLE_FONT
 
     best_units = get_best_generic_units(land_units, categories)
 
@@ -1162,12 +1356,12 @@ def build_goods_demands_generic(wb, land_units, categories, goods_demands):
             if not u:
                 continue
             for field in ["construction_demand", "maintenance_demand"]:
-                ref = u.get(field, "")
+                ref = u.get(field, "") or categories.get(u["category"], {}).get(field, "")
                 for g in goods_demands.get(ref, {}):
                     relevant_goods.add(g)
     relevant_goods = sorted(relevant_goods)
 
-    headers = ["Age", "Type", "Unit", "Demand Ref"] + relevant_goods
+    headers = ["Age", "Type", "Unit", "Demand Ref"] + relevant_goods + ["iron (total)"]
 
     row = 4
     for table_type, demand_field in [
@@ -1196,12 +1390,16 @@ def build_goods_demands_generic(wb, land_units, categories, goods_demands):
                 demand_ref = u.get(demand_field, "") or categories.get(u["category"], {}).get(demand_field, "")
                 goods = goods_demands.get(demand_ref, {})
 
+                # Resolve raw iron from all produced goods
+                raw = resolve_raw_materials(goods, production_recipes) if goods else {}
+                total_iron = round(raw.get("iron", 0), 4) or ""
+
                 values = [
                     AGE_LABELS.get(age, "?"),
                     t["type_label"],
-                    unit_name,
+                    loc(unit_name),
                     demand_ref,
-                ] + [goods.get(g, "") for g in relevant_goods]
+                ] + [goods.get(g, "") for g in relevant_goods] + [total_iron]
 
                 for j, v in enumerate(values, 1):
                     cell = ws.cell(row=row, column=j, value=v)
@@ -1221,12 +1419,161 @@ def build_goods_demands_generic(wb, land_units, categories, goods_demands):
     ws.freeze_panes = "E6"
 
 
+def pick_recipe(recipes, good, prefer_tier="workshop", prefer_variant="iron"):
+    """Pick a single production recipe for a good.
+
+    Prefers: workshop tier, iron-based variant. Falls back through tiers.
+    Returns dict of { input_good: amount_per_unit_output } or None.
+    """
+    candidates = recipes.get(good, [])
+    if not candidates:
+        return None
+
+    tier_order = [prefer_tier, "guild", "manufactory", "factory", "unknown"]
+
+    for tier in tier_order:
+        tier_recipes = [r for r in candidates if r["tier"] == tier]
+        if not tier_recipes:
+            continue
+        # Prefer iron-based variant
+        for r in tier_recipes:
+            if prefer_variant in r["method"]:
+                return {k: v / r["output"] for k, v in r["inputs"].items()}
+        # Prefer livestock over wild_game for leather
+        for r in tier_recipes:
+            if "livestock" in r["method"] or "cotton" in r["method"]:
+                return {k: v / r["output"] for k, v in r["inputs"].items()}
+        # Fall back to first recipe without "ammunition" or "stone" or "obsidian"
+        for r in tier_recipes:
+            if not any(x in r["method"] for x in ["ammunition", "stone", "obsidian", "pre_columbian"]):
+                return {k: v / r["output"] for k, v in r["inputs"].items()}
+        # Last resort
+        return {k: v / tier_recipes[0]["output"] for k, v in tier_recipes[0]["inputs"].items()}
+
+    return None
+
+
+def resolve_raw_materials(goods_needed, recipes, max_depth=3):
+    """Resolve produced goods into raw materials recursively.
+
+    goods_needed: { good_name: amount }
+    Returns: { raw_material: total_amount }
+    """
+    raw = {}
+    to_resolve = dict(goods_needed)
+
+    for _ in range(max_depth):
+        next_resolve = {}
+        for good, amount in to_resolve.items():
+            recipe = pick_recipe(recipes, good)
+            if recipe is None:
+                # It's a raw material (or unknown) — keep as-is
+                raw[good] = raw.get(good, 0) + amount
+            else:
+                # Produced good — break down into inputs
+                for input_good, input_amt in recipe.items():
+                    needed = input_amt * amount
+                    next_resolve[input_good] = next_resolve.get(input_good, 0) + needed
+        if not next_resolve:
+            break
+        to_resolve = next_resolve
+
+    # Any remaining unresolved go into raw
+    for good, amount in to_resolve.items():
+        raw[good] = raw.get(good, 0) + amount
+
+    return raw
+
+
+def build_raw_materials(wb, land_units, categories, goods_demands, production_recipes):
+    """Sheet: Raw material breakdown for generic units per age."""
+    ws = wb.create_sheet("Raw Materials")
+
+    ws.cell(row=1, column=1, value="Raw Material Requirements (Generic Units)").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Produced goods resolved to raw materials using workshop-tier iron-based recipes. "
+                  "Recursive: tools->iron, etc.").font = SUBTITLE_FONT
+
+    best_units = get_best_generic_units(land_units, categories)
+
+    # First pass: collect all raw materials that appear
+    all_raws = set()
+    unit_raws = {}  # (age, type_label, demand_field) -> raw dict
+    for age in AGE_ORDER:
+        for t in best_units[age]:
+            if t["unit_name"] == "-":
+                continue
+            u = next((u for u in land_units if u["name"] == t["unit_name"]), None)
+            if not u:
+                continue
+            for demand_field in ["construction_demand", "maintenance_demand"]:
+                ref = u.get(demand_field, "") or categories.get(u["category"], {}).get(demand_field, "")
+                goods = goods_demands.get(ref, {})
+                if goods:
+                    raw = resolve_raw_materials(goods, production_recipes)
+                    unit_raws[(age, t["type_label"], demand_field)] = raw
+                    all_raws.update(raw.keys())
+
+    all_raws = sorted(all_raws)
+    headers = ["Age", "Type", "Unit"] + all_raws
+
+    row = 4
+    for table_type, demand_field in [
+        ("Construction", "construction_demand"),
+        ("Maintenance", "maintenance_demand"),
+    ]:
+        ws.cell(row=row, column=1, value=f"{table_type} - Raw Materials").font = Font(bold=True, size=13)
+        row += 1
+
+        for i, h in enumerate(headers, 1):
+            ws.cell(row=row, column=i, value=h)
+        style_header_row(ws, row, len(headers))
+        row += 1
+
+        for age in AGE_ORDER:
+            for t in best_units[age]:
+                if t["unit_name"] == "-":
+                    continue
+                u = next((u for u in land_units if u["name"] == t["unit_name"]), None)
+                if not u:
+                    continue
+
+                cat_label = CAT_LABELS.get(u["category"], u["category"])
+                raw = unit_raws.get((age, t["type_label"], demand_field), {})
+
+                values = [
+                    AGE_LABELS.get(age, "?"),
+                    t["type_label"],
+                    loc(t["unit_name"]),
+                ] + [round(raw.get(g, 0), 4) if raw.get(g, 0) else "" for g in all_raws]
+
+                for j, v in enumerate(values, 1):
+                    cell = ws.cell(row=row, column=j, value=v)
+                    cell.border = THIN_BORDER
+                    if isinstance(v, float):
+                        cell.number_format = NUM_FMT_3
+                    cat_fill = CAT_FILLS.get(cat_label)
+                    if cat_fill:
+                        cell.fill = cat_fill
+
+                row += 1
+            row += 1  # gap between ages
+
+        row += 1  # gap between tables
+
+    auto_width(ws, min_width=6, max_width=15)
+    ws.freeze_panes = "D6"
+
+
 def main():
     if not DATA_DIR.exists():
         print("No data/ directory found. Run scraper.py first.")
         return
 
-    land_units, categories, age_progression, prices, combined_arms, goods_demands = load_data()
+    land_units, categories, age_progression, prices, combined_arms, goods_demands, production_recipes, localizations = load_data()
+
+    global LOC
+    LOC = localizations
 
     wb = Workbook()
 
@@ -1242,11 +1589,18 @@ def main():
     print("Building Optimal Composition (Gold) sheet...")
     build_optimal_composition_gold(wb, land_units, categories, combined_arms, prices)
 
+    print("Building Optimal Composition (Iron) sheet...")
+    build_optimal_composition_iron(wb, land_units, categories, combined_arms,
+                                    goods_demands, production_recipes)
+
     print("Building Goods Demands sheet...")
     build_goods_demands(wb, land_units, categories, goods_demands)
 
     print("Building Goods (Generic) sheet...")
-    build_goods_demands_generic(wb, land_units, categories, goods_demands)
+    build_goods_demands_generic(wb, land_units, categories, goods_demands, production_recipes)
+
+    print("Building Raw Materials sheet...")
+    build_raw_materials(wb, land_units, categories, goods_demands, production_recipes)
 
     print("Building Upgrade Chains sheet...")
     build_upgrade_chains(wb, land_units)

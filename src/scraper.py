@@ -4,7 +4,7 @@ import json
 import copy
 from pathlib import Path
 
-from parser import parse_directory
+from parser import parse_directory, parse_file
 
 GAME_DIR = Path("C:/Steam/steamapps/common/Europa Universalis V/game")
 COMMON_DIR = GAME_DIR / "in_game" / "common"
@@ -307,6 +307,112 @@ def scrape_goods_demands() -> dict:
     return demands
 
 
+def scrape_production_recipes() -> dict:
+    """Scrape production recipes from building_types/production_*.txt files.
+
+    Returns dict keyed by produced good, containing lists of recipes:
+    { "firearms": [ { "method": "guns_workshop_iron_maintenance", "tier": "workshop",
+                       "inputs": { "iron": 0.5, "tools": 0.3 }, "output": 1.0 }, ... ] }
+    """
+    building_dir = COMMON_DIR / "building_types"
+    recipes_by_good = {}
+
+    # Tier detection from category field
+    TIER_MAP = {
+        "guild_input": "guild",
+        "workshop_input": "workshop",
+        "manufactory_input": "manufactory",
+        "factory_input": "factory",
+    }
+    SKIP_KEYS = {"produced", "output", "category", "debug_max_profit"}
+
+    for filepath in sorted(building_dir.glob("production_*.txt")):
+        raw = parse_file(filepath)
+        # Walk all buildings in the file
+        for building_name, building_data in raw.items():
+            if not isinstance(building_data, dict):
+                continue
+            # unique_production_methods can appear multiple times (parsed as list)
+            upm = building_data.get("unique_production_methods", {})
+            if isinstance(upm, dict):
+                upm_list = [upm]
+            elif isinstance(upm, list):
+                upm_list = upm
+            else:
+                continue
+
+            for methods_block in upm_list:
+                if not isinstance(methods_block, dict):
+                    continue
+                for method_name, method_data in methods_block.items():
+                    if not isinstance(method_data, dict):
+                        continue
+                    produced = method_data.get("produced")
+                    output_amt = method_data.get("output")
+                    category = method_data.get("category", "")
+                    if not produced or not output_amt:
+                        continue
+
+                    inputs = {}
+                    for k, v in method_data.items():
+                        if k not in SKIP_KEYS and isinstance(v, (int, float)):
+                            inputs[k] = v
+
+                    tier = TIER_MAP.get(category, "unknown")
+                    recipe = {
+                        "method": method_name,
+                        "building": building_name,
+                        "tier": tier,
+                        "inputs": inputs,
+                        "output": output_amt,
+                    }
+                    recipes_by_good.setdefault(produced, []).append(recipe)
+
+    return recipes_by_good
+
+
+def scrape_unit_localizations() -> dict:
+    """Scrape display names for unit types from localization yml files.
+
+    Loads all english loc files to resolve $key$ cross-references.
+    Returns dict: { "a_footmen": "Footmen", "a_archers": "Archers", ... }
+    """
+    import re
+    loc_dir = GAME_DIR / "main_menu" / "localization" / "english"
+
+    # First pass: build a global lookup of ALL localization keys
+    all_loc = {}
+    for loc_file in sorted(loc_dir.glob("*_l_english.yml")):
+        text = loc_file.read_text(encoding="utf-8-sig")
+        for match in re.finditer(r'^\s+(\w+):\s*"([^"]*)"', text, re.MULTILINE):
+            all_loc[match.group(1)] = match.group(2)
+
+    # Resolve $key$ references (one pass is enough for single-depth refs)
+    def resolve(value: str) -> str:
+        def replacer(m):
+            ref_key = m.group(1)
+            return all_loc.get(ref_key, m.group(0))
+        return re.sub(r'\$(\w+)\$', replacer, value)
+
+    # Extract unit names (a_ and n_ prefixes) from the units file
+    units_file = loc_dir / "units_l_english.yml"
+    if not units_file.exists():
+        return {}
+
+    text = units_file.read_text(encoding="utf-8-sig")
+    names = {}
+    for match in re.finditer(r'^\s+([an]_\w+):\s*"([^"]*)"', text, re.MULTILINE):
+        key = match.group(1)
+        if key.endswith("_desc"):
+            continue
+        value = resolve(match.group(2))
+        # Strip [Script(...)] calls that can't be resolved statically
+        value = re.sub(r'\[.*?\]', '', value).strip()
+        names[key] = value
+
+    return names
+
+
 def scrape_combined_arms() -> dict:
     """Scrape combined arms defines from auto_modifiers/country.txt."""
     raw = parse_directory(COMMON_DIR / "auto_modifiers")
@@ -329,6 +435,12 @@ def main():
 
     print("Scraping goods demands...")
     goods_demands = scrape_goods_demands()
+
+    print("Scraping unit localizations...")
+    localizations = scrape_unit_localizations()
+
+    print("Scraping production recipes...")
+    recipes = scrape_production_recipes()
 
     print("Scraping combined arms defines...")
     combined_arms = scrape_combined_arms()
@@ -362,6 +474,15 @@ def main():
     age_progression = build_age_progression(units)
 
     # Save outputs
+    with open(OUTPUT_DIR / "localizations.json", "w") as f:
+        json.dump(localizations, f, indent=2)
+    print(f"  Wrote localizations.json ({len(localizations)} entries)")
+
+    with open(OUTPUT_DIR / "production_recipes.json", "w") as f:
+        json.dump(recipes, f, indent=2)
+    total_recipes = sum(len(v) for v in recipes.values())
+    print(f"  Wrote production_recipes.json ({len(recipes)} goods, {total_recipes} recipes)")
+
     with open(OUTPUT_DIR / "goods_demands.json", "w") as f:
         json.dump(goods_demands, f, indent=2)
     print(f"  Wrote goods_demands.json ({len(goods_demands)} demand types)")
