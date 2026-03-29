@@ -263,11 +263,52 @@ def build_age_progression(units: list[dict]) -> list[dict]:
     return rows
 
 
+def scrape_unit_prices() -> dict:
+    """Scrape unit build/reinforce/maintenance gold costs from prices/02_units.txt.
+
+    Returns dict keyed by category name, e.g.:
+    { "army_infantry": { "build_gold": 50, "reinforce_gold": 2.5, "maintenance_gold": 0.5 }, ... }
+    """
+    prices_dir = COMMON_DIR / "prices"
+    raw = parse_directory(prices_dir)
+
+    prices = {}
+    for cat in ["army_infantry", "army_cavalry", "army_artillery", "army_auxiliary",
+                 "navy_heavy_ship", "navy_light_ship", "navy_galley", "navy_transport"]:
+        entry = {}
+        for cost_type in ["build", "reinforce", "maintenance"]:
+            key = f"{cat}_{cost_type}"
+            if key in raw and isinstance(raw[key], dict):
+                entry[f"{cost_type}_gold"] = raw[key].get("gold", 0)
+                entry[f"{cost_type}_manpower"] = raw[key].get("manpower", raw[key].get("sailors", 0))
+        if entry:
+            prices[cat] = entry
+
+    return prices
+
+
+def scrape_combined_arms() -> dict:
+    """Scrape combined arms defines from auto_modifiers/country.txt."""
+    raw = parse_directory(COMMON_DIR / "auto_modifiers")
+    base = raw.get("country_base_values", {})
+    return {
+        "bonus_per_type": base.get("combined_bonus_per_type", 0),
+        "min_percent": base.get("combined_arms_min_percent_for_bonus", 0),
+        "max_threshold": base.get("combined_arms_max_threshold", 0),
+    }
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Scraping unit categories...")
     categories = scrape_categories()
+
+    print("Scraping unit prices...")
+    prices = scrape_unit_prices()
+
+    print("Scraping combined arms defines...")
+    combined_arms = scrape_combined_arms()
 
     print("Parsing unit type files...")
     raw_units = parse_directory(COMMON_DIR / "unit_types")
@@ -298,6 +339,14 @@ def main():
     age_progression = build_age_progression(units)
 
     # Save outputs
+    with open(OUTPUT_DIR / "combined_arms.json", "w") as f:
+        json.dump(combined_arms, f, indent=2)
+    print(f"  Wrote combined_arms.json ({combined_arms})")
+
+    with open(OUTPUT_DIR / "unit_prices.json", "w") as f:
+        json.dump(prices, f, indent=2)
+    print(f"  Wrote unit_prices.json ({len(prices)} categories)")
+
     with open(OUTPUT_DIR / "unit_categories.json", "w") as f:
         json.dump(categories, f, indent=2)
     print(f"  Wrote unit_categories.json ({len(categories)} categories)")
