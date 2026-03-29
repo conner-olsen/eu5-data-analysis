@@ -712,18 +712,64 @@ def get_best_generic_units(land_units, categories):
     return result
 
 
-def optimize_composition(type_powers, combined_arms):
-    """Find optimal percentage allocation to maximize total power.
+CENTER_RATIO = 1 / 3  # ~33% of army is center, ~67% flanks
+FLANK_RATIO = 1 - CENTER_RATIO
 
-    type_powers: list of float powers for each of the 6 types
-    combined_arms: dict with bonus_per_type, min_percent, max_threshold
+
+def calc_positional_power(pcts, flank_powers, center_powers):
+    """Calculate total army power with optimal positional placement.
+
+    Units are assigned to center (33%) or flanks (67%) to maximize power.
+    Each unit type uses its center_power when in center, flank_power on flanks.
+    The center/flank benefit ratio determines which types go where.
+    """
+    n = len(pcts)
+    if sum(pcts) < 1e-9:
+        return 0
+
+    # For each type, compute the center advantage ratio:
+    # how much MORE power it gets from center vs flank (relative)
+    # Types with highest center advantage should go to center first.
+    type_info = []
+    for i in range(n):
+        if pcts[i] < 1e-9:
+            continue
+        fp = flank_powers[i]
+        cp = center_powers[i]
+        # center_advantage = extra power gained per unit in center vs flank
+        advantage = cp - fp  # positive means center is better
+        type_info.append((i, pcts[i], fp, cp, advantage))
+
+    # Sort by center advantage descending — best center units first
+    type_info.sort(key=lambda x: x[4], reverse=True)
+
+    # Fill center slots (33% of army), then flanks (67%)
+    center_remaining = CENTER_RATIO
+    total_power = 0
+
+    for idx, pct, fp, cp, adv in type_info:
+        # How much of this type goes to center?
+        in_center = min(pct, center_remaining)
+        in_flank = pct - in_center
+        center_remaining -= in_center
+
+        total_power += in_center * cp + in_flank * fp
+
+    return total_power
+
+
+def optimize_composition(flank_powers, center_powers, combined_arms):
+    """Find optimal percentage allocation to maximize total positional power.
+
+    Uses positional placement: 33% center, 67% flanks.
+    Each type placed optimally based on its center vs flank advantage.
 
     Returns: (best_pcts, best_total, bonus_used, n_qualifying)
     """
     bonus_per_type = combined_arms["bonus_per_type"]
     min_pct = combined_arms["min_percent"]
     max_pct = combined_arms["max_threshold"]
-    n = len(type_powers)
+    n = len(flank_powers)
 
     best_total = -1
     best_pcts = [0.0] * n
@@ -735,12 +781,10 @@ def optimize_composition(type_powers, combined_arms):
         qualifying = [i for i in range(n) if mask & (1 << i)]
         k = len(qualifying)
 
-        # Skip if minimum allocation exceeds 100%
         if k * min_pct > 1.0:
             continue
 
-        # Skip if any qualifying type has zero power (can't field it)
-        if any(type_powers[i] <= 0 for i in qualifying):
+        if any(flank_powers[i] <= 0 for i in qualifying):
             continue
 
         # Allocate minimums
@@ -749,10 +793,14 @@ def optimize_composition(type_powers, combined_arms):
             pcts[i] = min_pct
         remaining = 1.0 - k * min_pct
 
-        # Greedily allocate remaining to highest-power types, capped at max_pct
-        sorted_indices = sorted(range(n), key=lambda i: type_powers[i], reverse=True)
+        # Greedily allocate remaining to types that contribute most power.
+        # Use a blended power estimate for greedy ordering:
+        # assume the marginal unit goes ~67% flank, ~33% center
+        blended = [FLANK_RATIO * flank_powers[i] + CENTER_RATIO * center_powers[i]
+                    for i in range(n)]
+        sorted_indices = sorted(range(n), key=lambda i: blended[i], reverse=True)
         for i in sorted_indices:
-            if type_powers[i] <= 0:
+            if blended[i] <= 0:
                 continue
             room = max_pct - pcts[i]
             add = min(remaining, room)
@@ -762,12 +810,11 @@ def optimize_composition(type_powers, combined_arms):
             if remaining <= 1e-9:
                 break
 
-        # Check max_threshold constraint
         bonus = bonus_per_type * k
         if any(p > max_pct + 1e-9 for p in pcts):
-            bonus = 0  # lose entire bonus
+            bonus = 0
 
-        weighted = sum(pcts[i] * type_powers[i] for i in range(n))
+        weighted = calc_positional_power(pcts, flank_powers, center_powers)
         total = weighted * (1 + bonus)
 
         if total > best_total:
@@ -777,14 +824,15 @@ def optimize_composition(type_powers, combined_arms):
             best_n_qual = k
 
     # Also try no-bonus: 100% in best type
-    best_idx = max(range(n), key=lambda i: type_powers[i])
-    no_bonus_total = type_powers[best_idx]
-    if no_bonus_total > best_total:
-        best_total = no_bonus_total
-        best_pcts = [0.0] * n
-        best_pcts[best_idx] = 1.0
-        best_bonus = 0.0
-        best_n_qual = 0
+    for i in range(n):
+        # 100% of one type — it fills both center and flank
+        power = CENTER_RATIO * center_powers[i] + FLANK_RATIO * flank_powers[i]
+        if power > best_total:
+            best_total = power
+            best_pcts = [0.0] * n
+            best_pcts[i] = 1.0
+            best_bonus = 0.0
+            best_n_qual = 0
 
     return best_pcts, best_total, best_bonus, best_n_qual
 
@@ -802,13 +850,16 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
                   f"min threshold={ca['min_percent']:.0%}, "
                   f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
     ws.cell(row=3, column=1,
+            value="Positional placement: 33% center / 67% flanks. "
+                  "Units assigned to center/flank to maximize power.").font = Font(italic=True)
+    ws.cell(row=4, column=1,
             value="Formulas: EffDmg = Str*CP*(1+StrDmgDone), "
-                  "FlankPower = EffDmg*10/((1-SFD)*DmgTaken*(1+StrDmgTaken)), "
-                  "Total = sum(pct*power) * (1+bonus)").font = Font(italic=True)
+                  "Power = EffDmg*10/((1-SFD)*DmgTaken*(1+StrDmgTaken)), "
+                  "Total = sum(positional_power) * (1+bonus)").font = Font(italic=True)
 
     best_units = get_best_generic_units(land_units, categories)
 
-    row = 5
+    row = 6
     for age in AGE_ORDER:
         types = best_units[age]
 
@@ -821,23 +872,35 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
             "Type", "Unit", "Strength", "CombatPower",
             "Str Dmg Done", "Str Dmg Taken", "Initiative",
             "Flank Power", "Center Power",
-            "Optimal %", "Contribution (Flank)", "Contribution (Center)",
+            "Optimal %", "Positional Power",
         ]
         for i, h in enumerate(headers, 1):
             ws.cell(row=row, column=i, value=h)
         style_header_row(ws, row, len(headers))
-        header_row = row
         row += 1
 
-        # Run optimizer for both flank and center
         flank_powers = [t["flank_power"] for t in types]
         center_powers = [t["center_power"] for t in types]
 
-        fp_pcts, fp_total, fp_bonus, fp_nq = optimize_composition(flank_powers, combined_arms)
-        cp_pcts, cp_total, cp_bonus, cp_nq = optimize_composition(center_powers, combined_arms)
+        pcts, total, bonus, nq = optimize_composition(
+            flank_powers, center_powers, combined_arms
+        )
 
-        # Use flank optimization for the percentages (primary)
-        pcts = fp_pcts
+        # Compute per-type positional contribution
+        # (replicating the placement logic for display)
+        center_remaining = CENTER_RATIO
+        type_positional = [0.0] * len(types)
+        placement = []
+        for idx, pct, fp, cp, adv in sorted(
+            [(i, pcts[i], flank_powers[i], center_powers[i], center_powers[i] - flank_powers[i])
+             for i in range(len(types)) if pcts[i] > 1e-9],
+            key=lambda x: x[4], reverse=True,
+        ):
+            in_center = min(pct, center_remaining)
+            in_flank = pct - in_center
+            center_remaining -= in_center
+            type_positional[idx] = in_center * cp + in_flank * fp
+            placement.append((idx, in_center, in_flank))
 
         for i, t in enumerate(types):
             pct = pcts[i]
@@ -847,51 +910,158 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
                 t["str_dmg_done"], t["str_dmg_taken"], t["initiative"],
                 t["flank_power"], t["center_power"],
                 pct,
-                pct * t["flank_power"],
-                pct * t["center_power"],
+                type_positional[i],
             ]
             for j, v in enumerate(values, 1):
                 cell = ws.cell(row=row, column=j, value=v)
                 cell.border = THIN_BORDER
                 if isinstance(v, float):
                     cell.number_format = NUM_FMT_2
-                if j == 10:  # Optimal % column
+                if j == 10:
                     cell.number_format = "0%"
-            # Bold the types that are part of the optimal mix
             if pct >= combined_arms["min_percent"] - 1e-9:
                 ws.cell(row=row, column=1).font = BEST_FONT
                 ws.cell(row=row, column=10).font = BEST_FONT
             row += 1
 
         # Summary rows
-        base_fp = sum(pcts[i] * flank_powers[i] for i in range(len(types)))
-        base_cp = sum(pcts[i] * center_powers[i] for i in range(len(types)))
+        base_power = calc_positional_power(pcts, flank_powers, center_powers)
 
         ws.cell(row=row, column=1, value="Base Power (no bonus)").font = Font(bold=True)
-        ws.cell(row=row, column=11, value=base_fp).number_format = NUM_FMT_2
-        ws.cell(row=row, column=12, value=base_cp).number_format = NUM_FMT_2
-        for j in [1, 11, 12]:
-            ws.cell(row=row, column=j).border = THIN_BORDER
+        ws.cell(row=row, column=11, value=base_power).number_format = NUM_FMT_2
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=11).border = THIN_BORDER
         row += 1
 
-        ws.cell(row=row, column=1, value=f"Combined Arms Bonus ({fp_nq} types)").font = Font(bold=True)
-        ws.cell(row=row, column=11, value=fp_bonus).number_format = "0.0%"
-        ws.cell(row=row, column=12, value=fp_bonus).number_format = "0.0%"
-        for j in [1, 11, 12]:
-            ws.cell(row=row, column=j).border = THIN_BORDER
+        ws.cell(row=row, column=1, value=f"Combined Arms Bonus ({nq} types)").font = Font(bold=True)
+        ws.cell(row=row, column=11, value=bonus).number_format = "0.0%"
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=11).border = THIN_BORDER
         row += 1
 
         ws.cell(row=row, column=1, value="Total Power (with bonus)").font = Font(bold=True, size=12)
-        ws.cell(row=row, column=11, value=fp_total).number_format = NUM_FMT_2
+        ws.cell(row=row, column=11, value=total).number_format = NUM_FMT_2
         ws.cell(row=row, column=11).font = Font(bold=True, size=12)
-        ws.cell(row=row, column=12, value=base_cp * (1 + fp_bonus)).number_format = NUM_FMT_2
-        ws.cell(row=row, column=12).font = Font(bold=True, size=12)
-        for j in [1, 11, 12]:
-            ws.cell(row=row, column=j).border = THIN_BORDER
-        row += 2  # gap between ages
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=11).border = THIN_BORDER
+        row += 2
 
     auto_width(ws, max_width=35)
-    ws.freeze_panes = "A5"
+    ws.freeze_panes = "A6"
+
+
+def build_optimal_composition_gold(wb, land_units, categories, combined_arms, prices):
+    """Sheet: Optimal army composition per age by power-per-gold."""
+    ws = wb.create_sheet("Optimal Comp (Gold)")
+
+    ws.cell(row=1, column=1, value="Optimal Army Composition (Power per Gold)").font = TITLE_FONT
+
+    ca = combined_arms
+    ws.cell(row=2, column=1,
+            value=f"Scraped: bonus/type={ca['bonus_per_type']:.1%}, "
+                  f"min threshold={ca['min_percent']:.0%}, "
+                  f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
+    ws.cell(row=3, column=1,
+            value="Positional placement: 33% center / 67% flanks. "
+                  "Optimizes power/gold instead of raw power.").font = Font(italic=True)
+    ws.cell(row=4, column=1,
+            value="Power/Gold = Power / (Strength * BaseBuildCost * 10) * 100").font = Font(italic=True)
+
+    best_units = get_best_generic_units(land_units, categories)
+
+    row = 6
+    for age in AGE_ORDER:
+        types = best_units[age]
+
+        ws.cell(row=row, column=1, value=AGE_LABELS[age]).font = Font(bold=True, size=13)
+        row += 1
+
+        headers = [
+            "Type", "Unit", "Strength", "CombatPower",
+            "Str Dmg Done", "Str Dmg Taken", "Initiative",
+            "Flank P/Gold", "Center P/Gold",
+            "Optimal %", "Positional P/Gold",
+        ]
+        for i, h in enumerate(headers, 1):
+            ws.cell(row=row, column=i, value=h)
+        style_header_row(ws, row, len(headers))
+        row += 1
+
+        # Compute power-per-gold for each type
+        flank_pg = []
+        center_pg = []
+        for t in types:
+            cat_key = [c for label, c, _ in CA_TYPES if label == t["type_label"]][0]
+            cost = calc_cost(t["strength"], cat_key, prices)
+            if cost > 0:
+                flank_pg.append(t["flank_power"] / cost * 100)
+                center_pg.append(t["center_power"] / cost * 100)
+            else:
+                flank_pg.append(0)
+                center_pg.append(0)
+
+        pcts, total, bonus, nq = optimize_composition(
+            flank_pg, center_pg, combined_arms
+        )
+
+        # Per-type positional contribution
+        center_remaining = CENTER_RATIO
+        type_positional = [0.0] * len(types)
+        for idx, pct, fpg, cpg, adv in sorted(
+            [(i, pcts[i], flank_pg[i], center_pg[i], center_pg[i] - flank_pg[i])
+             for i in range(len(types)) if pcts[i] > 1e-9],
+            key=lambda x: x[4], reverse=True,
+        ):
+            in_center = min(pct, center_remaining)
+            in_flank = pct - in_center
+            center_remaining -= in_center
+            type_positional[idx] = in_center * cpg + in_flank * fpg
+
+        for i, t in enumerate(types):
+            pct = pcts[i]
+            values = [
+                t["type_label"], t["unit_name"],
+                t["strength"], t["combat_power"],
+                t["str_dmg_done"], t["str_dmg_taken"], t["initiative"],
+                flank_pg[i], center_pg[i],
+                pct,
+                type_positional[i],
+            ]
+            for j, v in enumerate(values, 1):
+                cell = ws.cell(row=row, column=j, value=v)
+                cell.border = THIN_BORDER
+                if isinstance(v, float):
+                    cell.number_format = NUM_FMT_2
+                if j == 10:
+                    cell.number_format = "0%"
+            if pct >= combined_arms["min_percent"] - 1e-9:
+                ws.cell(row=row, column=1).font = BEST_FONT
+                ws.cell(row=row, column=10).font = BEST_FONT
+            row += 1
+
+        base_power = calc_positional_power(pcts, flank_pg, center_pg)
+
+        ws.cell(row=row, column=1, value="Base P/Gold (no bonus)").font = Font(bold=True)
+        ws.cell(row=row, column=11, value=base_power).number_format = NUM_FMT_2
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=11).border = THIN_BORDER
+        row += 1
+
+        ws.cell(row=row, column=1, value=f"Combined Arms Bonus ({nq} types)").font = Font(bold=True)
+        ws.cell(row=row, column=11, value=bonus).number_format = "0.0%"
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=11).border = THIN_BORDER
+        row += 1
+
+        ws.cell(row=row, column=1, value="Total P/Gold (with bonus)").font = Font(bold=True, size=12)
+        ws.cell(row=row, column=11, value=total).number_format = NUM_FMT_2
+        ws.cell(row=row, column=11).font = Font(bold=True, size=12)
+        ws.cell(row=row, column=1).border = THIN_BORDER
+        ws.cell(row=row, column=11).border = THIN_BORDER
+        row += 2
+
+    auto_width(ws, max_width=35)
+    ws.freeze_panes = "A6"
 
 
 def main():
@@ -911,6 +1081,9 @@ def main():
 
     print("Building Optimal Composition sheet...")
     build_optimal_composition(wb, land_units, categories, combined_arms)
+
+    print("Building Optimal Composition (Gold) sheet...")
+    build_optimal_composition_gold(wb, land_units, categories, combined_arms, prices)
 
     print("Building Upgrade Chains sheet...")
     build_upgrade_chains(wb, land_units)
