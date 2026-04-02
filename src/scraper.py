@@ -10,6 +10,8 @@ GAME_DIR = Path("C:/Steam/steamapps/common/Europa Universalis V/game")
 COMMON_DIR = GAME_DIR / "in_game" / "common"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data"
 
+MARITIME_VALUES = {}  # populated in main() before unit extraction
+
 # Stats we care about for army analysis
 NUMERIC_STATS = [
     "max_strength",
@@ -32,6 +34,13 @@ NUMERIC_STATS = [
     "food_consumption_per_strength",
     "damage_taken",
     "build_time_modifier",
+    # Naval stats
+    "hull_size",
+    "cannons",
+    "crew_size",
+    "blockade_capacity",
+    "transport_capacity",
+    "anti_piracy_warfare",
 ]
 
 # Properties to carry forward from inheritance
@@ -75,6 +84,10 @@ def scrape_categories() -> dict:
         for demand in ["maintenance_demand", "construction_demand"]:
             if demand in data:
                 cat[demand] = data[demand]
+        # Terrain combat/impact modifiers (used by naval categories like galley)
+        for terrain_key in ["combat", "impact"]:
+            if terrain_key in data and isinstance(data[terrain_key], dict):
+                cat[terrain_key] = resolve_terrain_block(data[terrain_key])
         categories[name] = cat
     return categories
 
@@ -193,6 +206,13 @@ def extract_unit_stats(name: str, data: dict, categories: dict) -> dict:
     # Maintenance/construction (just store the reference name)
     unit["maintenance_demand"] = data.get("maintenance_demand", "")
     unit["construction_demand"] = data.get("construction_demand", "")
+
+    # Maritime presence (resolve string reference to numeric value)
+    mp_ref = data.get("maritime_presence", "")
+    if isinstance(mp_ref, str) and mp_ref:
+        unit["maritime_presence"] = MARITIME_VALUES.get(mp_ref, 0)
+    elif isinstance(mp_ref, (int, float)):
+        unit["maritime_presence"] = mp_ref
 
     # Terrain modifiers
     combat = data.get("combat", {})
@@ -413,6 +433,22 @@ def scrape_unit_localizations() -> dict:
     return names
 
 
+def scrape_maritime_presence_values() -> dict:
+    """Scrape maritime presence script value definitions.
+
+    Returns: { "ship_small_maritime": 0.1, "ship_medium_maritime": 0.2, ... }
+    """
+    sv_file = GAME_DIR / "main_menu" / "common" / "script_values" / "default_values.txt"
+    if not sv_file.exists():
+        return {}
+    raw = parse_file(sv_file)
+    result = {}
+    for key, val in raw.items():
+        if key.startswith("ship_") and key.endswith("_maritime") and isinstance(val, (int, float)):
+            result[key] = val
+    return result
+
+
 def scrape_combined_arms() -> dict:
     """Scrape combined arms defines from auto_modifiers/country.txt."""
     raw = parse_directory(COMMON_DIR / "auto_modifiers")
@@ -441,6 +477,10 @@ def main():
 
     print("Scraping production recipes...")
     recipes = scrape_production_recipes()
+
+    print("Scraping maritime presence values...")
+    global MARITIME_VALUES
+    MARITIME_VALUES = scrape_maritime_presence_values()
 
     print("Scraping combined arms defines...")
     combined_arms = scrape_combined_arms()
