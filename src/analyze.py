@@ -89,7 +89,17 @@ def load_data():
         localizations = json.load(f)
     with open(DATA_DIR / "naval_units.json") as f:
         naval_units = json.load(f)
-    return land_units, categories, age_progression, prices, combined_arms, goods_demands, production_recipes, localizations, naval_units
+    with open(DATA_DIR / "food_goods.json") as f:
+        food_goods = json.load(f)
+    with open(DATA_DIR / "food_buildings.json") as f:
+        food_buildings = json.load(f)
+    with open(DATA_DIR / "building_caps.json") as f:
+        building_caps = json.load(f)
+    with open(DATA_DIR / "terrain_food_modifiers.json") as f:
+        terrain_food_modifiers = json.load(f)
+    return (land_units, categories, age_progression, prices, combined_arms,
+            goods_demands, production_recipes, localizations, naval_units,
+            food_goods, food_buildings, building_caps, terrain_food_modifiers)
 
 
 LOC = {}  # populated in main(), used by loc() helper
@@ -242,7 +252,7 @@ def highlight_best_in_age_by_cat(ws, data_rows, col_indices):
 def build_army_meta(wb, age_data, categories, prices):
     """Sheet 1: Army Composition Meta - per-age flank/center analysis."""
     ws = wb.active
-    ws.title = "Army Meta"
+    ws.title = "Unit Power"
 
     # Title
     ws.cell(row=1, column=1, value="EU5 Army Composition Meta").font = TITLE_FONT
@@ -428,6 +438,101 @@ def build_buildable_units(wb, land_units, categories, prices):
     ws.freeze_panes = f"A{header_row + 1}"
 
 
+def build_levy_units(wb, land_units, categories, prices):
+    """Levy Units sheet: all levy units per age with power analysis."""
+    ws = wb.create_sheet("Levy Units")
+
+    ws.cell(row=1, column=1, value="Levy Units by Age").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Red = best overall in age, Blue = best in category").font = Font(italic=True)
+
+    headers = [
+        "Age", "Category", "Unit",
+        "Flank Power", "Center Power", "Flank P/Gold", "Center P/Gold",
+        "Light", "Special",
+        "Strength", "Combat Power", "Combat Speed", "Initiative",
+        "Flanking", "Secure Flanks", "Damage Taken",
+        "Str Dmg Taken", "Morale Dmg Taken",
+        "Str Dmg Done", "Morale Dmg Done",
+        "Damage", "Build Cost",
+    ]
+    header_row = 4
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(headers))
+
+    HIGHLIGHT_COLS = [4, 5, 6, 7]
+
+    levies = [
+        u for u in land_units
+        if u.get("levy", False)
+    ]
+
+    tracked_rows = []
+    row = header_row + 1
+    for age in AGE_ORDER:
+        age_units = [u for u in levies if u.get("age") == age]
+        if not age_units:
+            continue
+
+        for u in sorted(age_units, key=lambda x: (x["category"], x["name"])):
+            cat = u["category"]
+            cat_data = categories.get(cat, {})
+            cat_label = CAT_LABELS.get(cat, cat)
+
+            strength = u.get("max_strength", 0)
+            cp = u.get("combat_power", 0)
+            cs = u.get("combat_speed", cat_data.get("combat_speed", 1))
+            fa = u.get("flanking_ability", cat_data.get("flanking_ability", 1.0))
+            sfd = u.get("secure_flanks_defense", cat_data.get("secure_flanks_defense", 0))
+            dmg_taken = u.get("damage_taken", cat_data.get("damage_taken", 1.0))
+
+            sdd = safe_num(u.get("strength_damage_done", 0))
+            sdt = safe_num(u.get("strength_damage_taken", 0))
+
+            damage = strength * cp
+            build_cost = calc_cost(strength, cat, prices)
+
+            fp = calc_flank_power(damage, sfd, dmg_taken, sdd, sdt)
+            center = calc_center_power(fp, sfd)
+            fp_gold = fp / build_cost * 100 if build_cost > 0 else 0
+            cp_gold = center / build_cost * 100 if build_cost > 0 else 0
+
+            values = [
+                AGE_LABELS.get(u.get("age", ""), "?"),
+                cat_label,
+                loc(u["name"]),
+                fp, center, fp_gold, cp_gold,
+                "Yes" if u.get("light") else "",
+                "Yes" if u.get("is_special") else "",
+                strength, cp, cs,
+                safe_num(u.get("initiative", cat_data.get("initiative", 1))),
+                fa, sfd, dmg_taken,
+                safe_num(u.get("strength_damage_taken", 0)),
+                safe_num(u.get("morale_damage_taken", 0)),
+                safe_num(u.get("strength_damage_done", 0)),
+                safe_num(u.get("morale_damage_done", 0)),
+                damage, build_cost,
+            ]
+            for i, v in enumerate(values, 1):
+                cell = ws.cell(row=row, column=i, value=v)
+                cell.border = THIN_BORDER
+                if isinstance(v, float):
+                    cell.number_format = NUM_FMT_2
+                cat_fill = CAT_FILLS.get(cat_label)
+                if cat_fill:
+                    cell.fill = cat_fill
+
+            tracked_rows.append((row, age, cat_label, {c: values[c - 1] for c in HIGHLIGHT_COLS}))
+            row += 1
+
+        row += 1  # gap between ages
+
+    highlight_best_in_age_by_cat(ws, tracked_rows, HIGHLIGHT_COLS)
+    auto_width(ws)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+
 def build_upgrade_chains(wb, land_units, categories, prices):
     """Sheet 3: Upgrade chains laid out horizontally."""
     ws = wb.create_sheet("Upgrade Chains")
@@ -495,6 +600,70 @@ def build_upgrade_chains(wb, land_units, categories, prices):
     auto_width(ws, min_width=10, max_width=45)
     ws.freeze_panes = f"A{header_row + 1}"
 
+
+def build_levy_upgrade_chains(wb, land_units, categories, prices):
+    """Levy upgrade chains laid out horizontally, same format as professional chains."""
+    ws = wb.create_sheet("Levy Upgrade Chains")
+
+    ws.cell(row=1, column=1, value="Levy Unit Upgrade Chains").font = TITLE_FONT
+    ws.cell(row=2, column=1, value="Each row shows a levy unit or upgrade path from earliest to latest age").font = SUBTITLE_FONT
+
+    headers = ["Category", "Type"] + [AGE_LABELS[a] for a in AGE_ORDER]
+    header_row = 4
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(headers))
+
+    units_by_name = {u["name"]: u for u in land_units}
+    levies = [
+        u for u in land_units
+        if u.get("levy", False)
+    ]
+
+    upgraded_to = {u.get("upgrades_to") for u in levies if u.get("upgrades_to")}
+    starters = [u for u in levies if u["name"] not in upgraded_to]
+
+    row = header_row + 1
+    for start in sorted(starters, key=lambda x: (x["category"], x.get("is_special", False), x["name"])):
+        cat_label = CAT_LABELS.get(start["category"], start["category"])
+        is_light = start.get("light", False)
+        is_special = start.get("is_special", False)
+        type_label = ("Special" if is_special else "Light" if is_light else "Heavy")
+
+        ws.cell(row=row, column=1, value=cat_label).border = THIN_BORDER
+        ws.cell(row=row, column=2, value=type_label).border = THIN_BORDER
+
+        current = start
+        visited = set()
+        while current and current["name"] not in visited:
+            visited.add(current["name"])
+            age = current.get("age", "")
+            if age in AGE_ORDER:
+                col = AGE_ORDER.index(age) + 3
+                cat = current["category"]
+                cat_data = categories.get(cat, {})
+                sfd = cat_data.get("secure_flanks_defense", 0)
+                dmg_taken = cat_data.get("damage_taken", 1.0)
+                sdd = safe_num(current.get("strength_damage_done", 0))
+                sdt = safe_num(current.get("strength_damage_taken", 0))
+                strength = current.get("max_strength", 0)
+                damage = strength * current.get("combat_power", 0)
+                fp = calc_flank_power(damage, sfd, dmg_taken, sdd, sdt)
+                cp = round(calc_center_power(fp, sfd), 1)
+                maint = round(calc_maintenance(strength, cat, prices), 1)
+                cell = ws.cell(row=row, column=col, value=f"{loc(current['name'])} ({cp}p, {maint}g)")
+                cell.border = THIN_BORDER
+                cat_fill = CAT_FILLS.get(cat_label)
+                if cat_fill:
+                    cell.fill = cat_fill
+
+            next_name = current.get("upgrades_to", "")
+            current = units_by_name.get(next_name) if next_name else None
+
+        row += 1
+
+    auto_width(ws, min_width=10, max_width=45)
+    ws.freeze_panes = f"A{header_row + 1}"
 
 
 def build_category_reference(wb, categories, prices):
@@ -847,9 +1016,9 @@ def optimize_composition(flank_powers, center_powers, combined_arms):
 
 def build_optimal_composition(wb, land_units, categories, combined_arms):
     """Sheet: Optimal army composition per age using combined arms."""
-    ws = wb.create_sheet("Optimal Composition")
+    ws = wb.create_sheet("Optimal Comp (K-D)")
 
-    ws.cell(row=1, column=1, value="Optimal Army Composition (Combined Arms)").font = TITLE_FONT
+    ws.cell(row=1, column=1, value="Optimal Army Composition (K/D)").font = TITLE_FONT
 
     # Show scraped combined arms values
     ca = combined_arms
@@ -1312,9 +1481,9 @@ def optimize_budget(best_units_age, cheapest_units, prices, combined_arms):
 
 def build_optimal_composition_budget(wb, land_units, categories, combined_arms, prices):
     """Sheet: Optimal composition allowing cheap filler units from any age."""
-    ws = wb.create_sheet("Optimal Comp (Budget)")
+    ws = wb.create_sheet("Optimal Comp (Gold-Mixed Age)")
 
-    ws.cell(row=1, column=1, value="Optimal Army Composition (Budget - Mixed Age)").font = TITLE_FONT
+    ws.cell(row=1, column=1, value="Optimal Army Composition (Gold-Mixed Age)").font = TITLE_FONT
 
     ca = combined_arms
     ws.cell(row=2, column=1,
@@ -1422,9 +1591,9 @@ def build_optimal_composition_budget(wb, land_units, categories, combined_arms, 
 
 def build_optimal_composition_gold(wb, land_units, categories, combined_arms, prices):
     """Sheet: Optimal army composition per age by power-per-gold."""
-    ws = wb.create_sheet("Optimal Comp (Gold)")
+    ws = wb.create_sheet("Optimal Comp (Gold-Same Age)")
 
-    ws.cell(row=1, column=1, value="Optimal Army Composition (Power per Gold)").font = TITLE_FONT
+    ws.cell(row=1, column=1, value="Optimal Army Composition (Gold-Same Age)").font = TITLE_FONT
 
     ca = combined_arms
     ws.cell(row=2, column=1,
@@ -2709,23 +2878,931 @@ def build_navy_terrain_gold(wb, naval_units, categories, prices):
     ws.freeze_panes = f"A{header_row + 1}"
 
 
+# ---------------------------------------------------------------------------
+#  Food analysis helpers
+# ---------------------------------------------------------------------------
+
+FOOD_BUILDING_ORDER = [
+    "farming_village", "fishing_village", "forest_village", "fruit_orchard",
+    "sheep_farms", "windmill", "irrigation_systems", "pound_lock_canal_infrastructure",
+    "market_village", "elephant_hunting_grounds",
+]
+
+FOOD_BUILDING_LABELS = {
+    "farming_village": "Farming Village",
+    "fishing_village": "Fishing Village",
+    "forest_village": "Forest Village",
+    "fruit_orchard": "Fruit Orchard",
+    "sheep_farms": "Sheep Farms",
+    "windmill": "Windmill",
+    "irrigation_systems": "Irrigation",
+    "pound_lock_canal_infrastructure": "Canal",
+    "market_village": "Market Village",
+    "elephant_hunting_grounds": "Elephant Grounds",
+}
+
+VEG_ORDER = ["farmland", "grasslands", "woods", "jungle", "forest", "sparse", "desert"]
+TOPO_ORDER = ["flatland", "hills", "plateau", "wetlands", "mountains"]
+
+
+def calc_building_cap(cap_name, caps, dev, rgo_workers, has_river):
+    """Compute max building levels from a cap formula."""
+    cap = caps.get(cap_name, {})
+    if not cap:
+        return 0
+    levels = cap.get("base", 0)
+    levels += cap.get("per_development", 0) * dev
+    levels += cap.get("per_max_rgo_workers", 0) * rgo_workers
+    if has_river:
+        levels += cap.get("if_river", 0)
+    return int(levels)
+
+
+def resolve_max_levels(bld, caps, dev, rgo_workers, has_river):
+    """Resolve a building's max_levels to an integer."""
+    ml = bld.get("max_levels", 1)
+    if isinstance(ml, int):
+        return ml
+    if isinstance(ml, str):
+        return calc_building_cap(ml, caps, dev, rgo_workers, has_river)
+    # Complex expression (e.g., elephant_hunting_grounds with conditional)
+    if isinstance(ml, dict):
+        base_ref = ml.get("value", "")
+        if isinstance(base_ref, str):
+            return calc_building_cap(base_ref, caps, dev, rgo_workers, has_river)
+    return 1
+
+
+def building_available(bld, rgo, vegetation, has_river, is_coastal):
+    """Check if a building is available for a given location profile."""
+    reqs = bld.get("requirements", {})
+
+    # RGO check: if building requires specific RGOs, location must have one
+    req_rgos = reqs.get("rgo", [])
+    if req_rgos and rgo not in req_rgos:
+        return False
+
+    # Vegetation check: if building requires specific vegetation, location must match
+    req_veg = reqs.get("vegetation", [])
+    if req_veg and vegetation not in req_veg:
+        return False
+
+    # Feature checks: OR logic — if building needs any of these features, at least one must match
+    req_features = reqs.get("features", [])
+    if req_features:
+        has_any = False
+        for feat in req_features:
+            if feat == "is_coastal" and is_coastal:
+                has_any = True
+            elif feat == "has_river" and has_river:
+                has_any = True
+            elif feat == "is_adjacent_to_lake":
+                # Lakes are rare; treat as equivalent to river for analysis
+                has_any = has_any or has_river
+        if not has_any:
+            return False
+
+    return True
+
+
+def calc_building_food(bld, food_goods):
+    """Calculate food contribution per level for a building.
+
+    Returns (goods_food_per_level, food_modifier_per_level, flat_food_per_level, rgo_output_mod_note).
+    """
+    goods_food = 0.0
+    produces = bld.get("produces")
+    if produces:
+        good = produces["good"]
+        output = produces["output_per_level"]
+        food_val = food_goods.get(good, {}).get("food_value", 0)
+        goods_food = output * food_val
+
+    food_mod = bld.get("food_modifiers", {}).get("local_monthly_food_modifier", 0)
+    flat_food = bld.get("food_modifiers", {}).get("local_monthly_food", 0)
+
+    rgo_notes = ""
+    rgo_mods = bld.get("rgo_output_modifiers", {})
+    if rgo_mods:
+        parts = []
+        for good, mod in rgo_mods.items():
+            parts.append(f"+{mod:.0%} {good}")
+        rgo_notes = ", ".join(parts)
+
+    return goods_food, food_mod, flat_food, rgo_notes
+
+
+def build_food_reference(wb, food_goods, food_buildings, caps, terrain_mods):
+    """Reference sheet listing all food goods and food buildings."""
+    ws = wb.create_sheet("Food Reference")
+
+    # --- Food Goods section ---
+    ws.cell(row=1, column=1, value="Food Goods Reference").font = TITLE_FONT
+
+    goods_headers = ["Good", "Food Value", "Method", "Price"]
+    header_row = 3
+    for i, h in enumerate(goods_headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(goods_headers))
+
+    sorted_goods = sorted(food_goods.items(), key=lambda x: -x[1]["food_value"])
+    for r, (name, data) in enumerate(sorted_goods, header_row + 1):
+        values = [name, data["food_value"], data["method"], data["price"]]
+        for i, v in enumerate(values, 1):
+            cell = ws.cell(row=r, column=i, value=v)
+            cell.border = THIN_BORDER
+            if isinstance(v, float):
+                cell.number_format = NUM_FMT_2
+
+    # --- Food Buildings section ---
+    bld_start = header_row + len(sorted_goods) + 3
+    ws.cell(row=bld_start, column=1, value="Food Buildings Reference").font = TITLE_FONT
+
+    bld_headers = [
+        "Building", "Max Levels", "RGO Req", "Vegetation Req", "Feature Req",
+        "Produces", "Output/Lvl", "Food/Lvl (goods)", "Food Mod%/Lvl", "Flat Food/Lvl",
+        "RGO Output Mod", "Food Capacity/Lvl",
+    ]
+    bld_hdr_row = bld_start + 1
+    for i, h in enumerate(bld_headers, 1):
+        ws.cell(row=bld_hdr_row, column=i, value=h)
+    style_header_row(ws, bld_hdr_row, len(bld_headers))
+
+    row = bld_hdr_row + 1
+    for bld_name in FOOD_BUILDING_ORDER:
+        bld = food_buildings.get(bld_name)
+        if not bld:
+            continue
+        reqs = bld.get("requirements", {})
+        goods_food, food_mod, flat_food, rgo_note = calc_building_food(bld, food_goods)
+        produces = bld.get("produces")
+        ml = bld.get("max_levels", 1)
+        ml_display = ml if isinstance(ml, int) else str(ml) if isinstance(ml, str) else "varies"
+
+        values = [
+            FOOD_BUILDING_LABELS.get(bld_name, bld_name),
+            ml_display,
+            ", ".join(reqs.get("rgo", [])) or "-",
+            ", ".join(reqs.get("vegetation", [])) or "-",
+            ", ".join(reqs.get("features", [])) or "-",
+            produces["good"] if produces else "-",
+            produces["output_per_level"] if produces else 0,
+            goods_food,
+            food_mod,
+            flat_food,
+            rgo_note or "-",
+            bld.get("food_modifiers", {}).get("local_food_capacity", 0),
+        ]
+        for i, v in enumerate(values, 1):
+            cell = ws.cell(row=row, column=i, value=v)
+            cell.border = THIN_BORDER
+            if isinstance(v, float):
+                cell.number_format = NUM_FMT_3 if abs(v) < 1 else NUM_FMT_2
+        row += 1
+
+    # --- Terrain Modifiers section ---
+    terr_start = row + 2
+    ws.cell(row=terr_start, column=1, value="Terrain Food Modifiers").font = TITLE_FONT
+
+    terr_headers = ["Type", "Category", "Food Modifier"]
+    terr_hdr_row = terr_start + 1
+    for i, h in enumerate(terr_headers, 1):
+        ws.cell(row=terr_hdr_row, column=i, value=h)
+    style_header_row(ws, terr_hdr_row, len(terr_headers))
+
+    row = terr_hdr_row + 1
+    for category, entries in terrain_mods.items():
+        for name, data in entries.items():
+            mod = data.get("local_monthly_food_modifier", 0)
+            values = [name, category, mod]
+            for i, v in enumerate(values, 1):
+                cell = ws.cell(row=row, column=i, value=v)
+                cell.border = THIN_BORDER
+                if isinstance(v, float):
+                    cell.number_format = "+0%;-0%;0%"
+            row += 1
+
+    # --- Building Caps section ---
+    cap_start = row + 2
+    ws.cell(row=cap_start, column=1, value="Building Cap Formulas").font = TITLE_FONT
+
+    cap_headers = ["Cap Name", "Base", "Per Dev", "Per RGO Workers", "If River"]
+    cap_hdr_row = cap_start + 1
+    for i, h in enumerate(cap_headers, 1):
+        ws.cell(row=cap_hdr_row, column=i, value=h)
+    style_header_row(ws, cap_hdr_row, len(cap_headers))
+
+    row = cap_hdr_row + 1
+    for cap_name, cap_data in caps.items():
+        values = [
+            cap_name,
+            cap_data.get("base", 0),
+            cap_data.get("per_development", 0),
+            cap_data.get("per_max_rgo_workers", 0),
+            cap_data.get("if_river", 0),
+        ]
+        for i, v in enumerate(values, 1):
+            cell = ws.cell(row=row, column=i, value=v)
+            cell.border = THIN_BORDER
+            if isinstance(v, float):
+                cell.number_format = NUM_FMT_2
+        row += 1
+
+    auto_width(ws, max_width=40)
+
+
+def _calc_crossover(rgo_food_val, goods_f, mod_f, flat_f, rgo_note):
+    """Calculate the RGO level at which a building becomes better than another RGO level.
+
+    At N RGO levels producing N * rgo_food_val total RGO food:
+    - Another RGO level gives: +rgo_food_val
+    - This building gives: goods_f + flat_f + mod_f * total_base_food
+    - Crossover: goods_f + flat_f + mod_f * N * rgo_food_val >= rgo_food_val
+
+    For windmill (+X% RGO output): 0.1 * N * rgo_food_val >= rgo_food_val → N >= 10
+
+    Returns crossover N (int), or None if building is always better or never better via modifier.
+    """
+    constant = goods_f + flat_f
+
+    if mod_f > 0:
+        # goods_f + flat_f + mod_f * N * rgo_food_val >= rgo_food_val
+        # mod_f * N * rgo_food_val >= rgo_food_val - constant
+        shortfall = rgo_food_val - constant
+        if shortfall <= 0:
+            return 0  # always better than RGO (constant food alone beats it)
+        if rgo_food_val == 0:
+            return None
+        n = shortfall / (mod_f * rgo_food_val)
+        return int(n) + (1 if n != int(n) else 0)  # ceiling
+
+    if rgo_note:
+        # Windmill: extracts the modifier from rgo_note (10% = 0.1 per good)
+        # Simplified: assume +10% RGO output → 0.1 * N * rgo_food_val >= rgo_food_val → N >= 10
+        return 10
+
+    if constant >= rgo_food_val:
+        return 0  # always better
+    return None  # never better via modifier (pure constant food, less than RGO)
+
+
+def _rank_buildings_for_profile(available, food_buildings, food_goods, rgo_good, rgo_workers):
+    """Rank available buildings by build priority for a location profile.
+
+    Includes the base RGO and crossover points.
+
+    Returns list of (label, max_levels, food_display, crossover) sorted by initial priority.
+    crossover = RGO level at which this building becomes better than another RGO level.
+    """
+    rgo_food_val = food_goods.get(rgo_good, {}).get("food_value", 0)
+    entries = []
+
+    # Add the base RGO
+    if rgo_food_val > 0:
+        entries.append({
+            "name": "_rgo",
+            "label": f"RGO ({rgo_good})",
+            "levels": rgo_workers,
+            "goods_f": rgo_food_val,
+            "mod_f": 0,
+            "flat_f": 0,
+            "rgo_note": "",
+            "crossover": None,  # RGO is the baseline
+            "sort_key": (0, -rgo_food_val),
+        })
+
+    for bld_name, levels in available.items():
+        bld = food_buildings[bld_name]
+        label = FOOD_BUILDING_LABELS.get(bld_name, bld_name)
+        goods_f, mod_f, flat_f, rgo_note = calc_building_food(bld, food_goods)
+        constant = goods_f + flat_f
+
+        if constant == 0 and mod_f == 0 and not rgo_note:
+            continue
+        if mod_f < 0 and constant == 0:
+            continue
+
+        crossover = _calc_crossover(rgo_food_val, goods_f, mod_f, flat_f, rgo_note)
+
+        # Sort: constant food producers first (by food desc), then modifier buildings
+        if rgo_note and constant == 0 and mod_f == 0:
+            sort_key = (2, 0)
+        elif constant > 0:
+            sort_key = (1, -constant)
+        else:
+            sort_key = (3, -mod_f)
+
+        entries.append({
+            "name": bld_name,
+            "label": label,
+            "levels": levels,
+            "goods_f": goods_f,
+            "mod_f": mod_f,
+            "flat_f": flat_f,
+            "rgo_note": rgo_note,
+            "crossover": crossover,
+            "sort_key": sort_key,
+        })
+
+    # Sort by crossover point: RGO first (baseline), then by when each building
+    # becomes worth building (lower crossover = build sooner).
+    # "always" (0) before numeric, numeric ascending, "never" (None) last.
+    def sort_key(e):
+        if e["name"] == "_rgo":
+            return (-1, 0)  # always first
+        xover = e["crossover"]
+        if xover is None:
+            return (10000, 0)  # never beats RGO — last
+        return (xover, -e["goods_f"] - e["flat_f"])
+
+    entries.sort(key=sort_key)
+    return entries
+
+
+def build_food_location_buildup(wb, food_goods, food_buildings, caps, terrain_mods):
+    """Main sheet: build order / ratio table per location profile."""
+    ws = wb.create_sheet("Food Build Order")
+
+    ws.cell(row=1, column=1, value="Food Production Build Order by Location").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="'Build After' = the RGO level at which this building gives more food than another RGO level. "
+                  "Topo adjusts Terrain Mod%: hills -10%, wetlands -10%, mountains -20%.").font = SUBTITLE_FONT
+
+    DEV = 10
+    RGO_WORKERS = 3
+
+    relevant_buildings = [b for b in FOOD_BUILDING_ORDER if b in food_buildings]
+
+    MAX_SLOTS = 7  # RGO + up to 6 buildings
+
+    fixed_headers = ["RGO", "Food Val", "Vegetation", "River", "Coastal", "Terrain\nMod%"]
+    slot_headers = []
+    for i in range(1, MAX_SLOTS + 1):
+        slot_headers.extend([f"#{i} Building", f"#{i} Build After\n(RGO lvl)", f"#{i} Ratio\nvs RGO", f"#{i} Food/Lvl"])
+    tail_headers = ["Build Order"]
+
+    all_headers = fixed_headers + slot_headers + tail_headers
+    header_row = 4
+    for i, h in enumerate(all_headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(all_headers))
+
+    food_rgo_goods = sorted(
+        [(name, data["food_value"]) for name, data in food_goods.items()],
+        key=lambda x: -x[1]
+    )
+
+    VEG_FILLS = {
+        "farmland": PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"),
+        "grasslands": PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid"),
+        "woods": PatternFill(start_color="E8E0D0", end_color="E8E0D0", fill_type="solid"),
+        "jungle": PatternFill(start_color="D5F5D5", end_color="D5F5D5", fill_type="solid"),
+        "forest": PatternFill(start_color="C5D9C5", end_color="C5D9C5", fill_type="solid"),
+        "sparse": PatternFill(start_color="F5F0E0", end_color="F5F0E0", fill_type="solid"),
+        "desert": PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
+    }
+
+    row = header_row + 1
+
+    for rgo, rgo_food_val in food_rgo_goods:
+        for veg in VEG_ORDER:
+            for has_river in [True, False]:
+                for is_coastal in [True, False]:
+                    veg_mod = terrain_mods.get("vegetation", {}).get(veg, {}).get("local_monthly_food_modifier", 0)
+                    rank_mod = terrain_mods.get("location_ranks", {}).get("rural_settlement", {}).get("local_monthly_food_modifier", 0)
+                    terrain_total_mod = veg_mod + rank_mod
+
+                    available = {}
+                    for bld_name in relevant_buildings:
+                        bld = food_buildings[bld_name]
+                        if building_available(bld, rgo, veg, has_river, is_coastal):
+                            levels = resolve_max_levels(bld, caps, DEV, RGO_WORKERS, has_river)
+                            if levels > 0:
+                                available[bld_name] = levels
+
+                    if not available:
+                        continue
+
+                    ranked = _rank_buildings_for_profile(available, food_buildings, food_goods, rgo, RGO_WORKERS)
+                    if not ranked:
+                        continue
+
+                    fixed_vals = [
+                        rgo, rgo_food_val, veg,
+                        "Yes" if has_river else "No",
+                        "Yes" if is_coastal else "No",
+                        terrain_total_mod,
+                    ]
+
+                    slot_vals = []
+                    order_parts = []
+                    for i in range(MAX_SLOTS):
+                        if i < len(ranked):
+                            e = ranked[i]
+                            constant = e["goods_f"] + e["flat_f"]
+
+                            # Food/level display
+                            if e["rgo_note"]:
+                                food_display = e["rgo_note"]
+                            elif constant > 0 and e["mod_f"] > 0:
+                                food_display = f"{constant:.1f} + {e['mod_f']:.0%}/lvl"
+                            elif constant > 0:
+                                food_display = f"{constant:.1f}"
+                            elif e["mod_f"] > 0:
+                                food_display = f"{e['mod_f']:.0%}/lvl"
+                            else:
+                                food_display = f"{constant:.1f}"
+
+                            # Crossover display
+                            xover = e["crossover"]
+                            if e["name"] == "_rgo":
+                                xover_display = "baseline"
+                            elif xover is None:
+                                xover_display = "never"
+                            elif xover == 0:
+                                xover_display = "always"
+                            else:
+                                xover_display = xover
+
+                            # Ratio vs RGO:
+                            # - RGO itself: baseline
+                            # - Modifier buildings (food_mod > 0): 1:1 after threshold
+                            #   (math: optimal M = N - threshold, so each RGO level past
+                            #   threshold pairs with 1 building level)
+                            # - One-time buildings (max 1 level): build once
+                            # - Constant-food-only (no modifier): after RGO maxed
+                            if e["name"] == "_rgo":
+                                ratio_display = "-"
+                            elif e["mod_f"] > 0 and e["levels"] > 1:
+                                ratio_display = "1:1"
+                            elif e["levels"] == 1:
+                                ratio_display = "build once"
+                            elif e["rgo_note"]:
+                                ratio_display = "build once"
+                            else:
+                                ratio_display = "after max RGO"
+
+                            slot_vals.extend([e["label"], xover_display, ratio_display, food_display])
+
+                            # Build order string with crossover info
+                            lvl_str = f"x{e['levels']}" if e["name"] != "_rgo" else "scale"
+                            if e["name"] == "_rgo":
+                                order_parts.append(f"{e['label']}")
+                            elif xover is not None and xover > 0:
+                                order_parts.append(f"{e['label']} ({lvl_str}, @{xover} RGO)")
+                            else:
+                                order_parts.append(f"{e['label']} ({lvl_str})")
+                        else:
+                            slot_vals.extend(["", "", "", ""])
+
+                    build_order_str = " > ".join(order_parts)
+
+                    all_vals = fixed_vals + slot_vals + [build_order_str]
+
+                    for i, v in enumerate(all_vals, 1):
+                        cell = ws.cell(row=row, column=i, value=v)
+                        cell.border = THIN_BORDER
+                        if isinstance(v, float):
+                            if abs(v) < 1 and v != 0:
+                                cell.number_format = "+0%;-0%;0%"
+                            else:
+                                cell.number_format = NUM_FMT_2
+
+                    veg_fill = VEG_FILLS.get(veg)
+                    if veg_fill:
+                        for c in range(1, len(fixed_headers) + 1):
+                            ws.cell(row=row, column=c).fill = veg_fill
+
+                    row += 1
+
+    auto_width(ws, max_width=25)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+
+def build_food_build_order_by_rgo(wb, food_goods, food_buildings):
+    """Simplified build order: one row per RGO, all buildings ranked.
+
+    Terrain only affects availability, not crossover math, so this sheet
+    lists every possible food building per RGO in priority order.
+    Skip buildings not available at your location.
+    """
+    ws = wb.create_sheet("Build Order by RGO")
+
+    ws.cell(row=1, column=1, value="Food Build Order by RGO").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Per-building in isolation (ignores modifier interactions). "
+                  "'Build After' = the RGO level at which this building beats another RGO level. "
+                  "See 'Compound Build Order' sheet for accurate ratios when multiple modifier buildings interact. "
+                  "Skip buildings unavailable at your location.").font = SUBTITLE_FONT
+
+    # Exclude market_village (no food) and elephant_hunting_grounds (negative)
+    bld_names = [b for b in FOOD_BUILDING_ORDER
+                 if b in food_buildings and b not in ("market_village", "elephant_hunting_grounds")]
+
+    MAX_SLOTS = len(bld_names)
+
+    fixed_headers = ["RGO", "RGO\nFood/Lvl"]
+    slot_headers = []
+    for i in range(1, MAX_SLOTS + 1):
+        slot_headers.extend([
+            f"#{i} Building",
+            f"#{i} Build After\n(RGO lvl)",
+            f"#{i} Food/Lvl",
+            f"#{i} Requires",
+        ])
+
+    all_headers = fixed_headers + slot_headers
+    header_row = 4
+    for i, h in enumerate(all_headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(all_headers))
+
+    sorted_goods = sorted(food_goods.items(), key=lambda x: -x[1]["food_value"])
+
+    row = header_row + 1
+    for rgo_name, rgo_data in sorted_goods:
+        rgo_fv = rgo_data["food_value"]
+
+        entries = []
+        for bld_name in bld_names:
+            bld = food_buildings[bld_name]
+
+            # Filter out buildings that require a different RGO
+            req_rgos = bld.get("requirements", {}).get("rgo", [])
+            if req_rgos and rgo_name not in req_rgos:
+                continue
+
+            label = FOOD_BUILDING_LABELS.get(bld_name, bld_name)
+            goods_f, mod_f, flat_f, rgo_note = calc_building_food(bld, food_goods)
+            constant = goods_f + flat_f
+
+            xover = _calc_crossover(rgo_fv, goods_f, mod_f, flat_f, rgo_note)
+
+            # Food display
+            if rgo_note:
+                food_display = rgo_note
+            elif constant > 0 and mod_f > 0:
+                food_display = f"{constant:.1f} + {mod_f:.0%}/lvl"
+            elif constant > 0:
+                food_display = f"{constant:.1f}"
+            elif mod_f > 0:
+                food_display = f"{mod_f:.0%}/lvl"
+            else:
+                food_display = f"{constant:.1f}"
+
+            # Build After display
+            if xover is None:
+                build_after = "after max RGO"
+            elif xover == 0:
+                build_after = "always"
+            else:
+                build_after = xover
+
+            # Requirements summary
+            reqs = bld.get("requirements", {})
+            req_parts = []
+            if reqs.get("rgo"):
+                req_parts.append("RGO: " + ", ".join(reqs["rgo"]))
+            if reqs.get("vegetation"):
+                req_parts.append("veg: " + ", ".join(reqs["vegetation"]))
+            if reqs.get("features"):
+                req_parts.append(", ".join(reqs["features"]))
+            requires = "; ".join(req_parts) if req_parts else "any"
+
+            # Sort key
+            if xover is None:
+                sort_val = 10000
+            elif xover == 0:
+                sort_val = -1
+            else:
+                sort_val = xover
+
+            entries.append({
+                "label": label,
+                "build_after": build_after,
+                "food_display": food_display,
+                "requires": requires,
+                "crossover_sort": (sort_val, -constant),
+            })
+
+        entries.sort(key=lambda x: x["crossover_sort"])
+
+        # Write row
+        ws.cell(row=row, column=1, value=rgo_name).border = THIN_BORDER
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        ws.cell(row=row, column=2, value=rgo_fv).border = THIN_BORDER
+
+        col = 3
+        for e in entries:
+            ws.cell(row=row, column=col, value=e["label"]).border = THIN_BORDER
+            ws.cell(row=row, column=col + 1, value=e["build_after"]).border = THIN_BORDER
+            ws.cell(row=row, column=col + 2, value=e["food_display"]).border = THIN_BORDER
+            ws.cell(row=row, column=col + 3, value=e["requires"]).border = THIN_BORDER
+            col += 4
+
+        row += 1
+
+    auto_width(ws, max_width=30)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+
+def _simulate_compound_build_order(rgo_fv, buildings, max_rgo=40):
+    """Simulate greedy build order accounting for modifier interactions.
+
+    At each step, build whichever option (RGO level or building level) gives
+    the highest marginal food increase.
+
+    Total food = (N*fv*(1+rgo_mod) + sum(goods_food*lvls)) * (1 + sum(food_mod*lvls))
+
+    Returns (first_built, phases):
+      first_built: {building_name: rgo_level_when_first_built}
+      phases: list of (description_string) showing the build pattern
+    """
+    n_rgo = 0
+    rgo_mod = 0.0
+    lvls = {b["name"]: 0 for b in buildings}
+    first_built = {}
+    labels = {b["name"]: FOOD_BUILDING_LABELS.get(b["name"], b["name"]) for b in buildings}
+
+    # Track sequence for phase extraction
+    sequence = []  # list of ("_rgo" or building_name) per step
+
+    for _ in range(300):
+        base_food = n_rgo * rgo_fv * (1 + rgo_mod)
+        for b in buildings:
+            base_food += lvls[b["name"]] * b["goods_food"]
+
+        total_mod = sum(lvls[b["name"]] * b["food_mod"] for b in buildings)
+
+        best_val = -1
+        best_name = None
+
+        if n_rgo < max_rgo:
+            m = rgo_fv * (1 + rgo_mod) * (1 + total_mod)
+            if m > best_val:
+                best_val = m
+                best_name = "_rgo"
+
+        for b in buildings:
+            if lvls[b["name"]] >= b["max_levels"]:
+                continue
+            if b["rgo_output_mod"] > 0 and lvls[b["name"]] == 0:
+                m = b["rgo_output_mod"] * n_rgo * rgo_fv * (1 + total_mod)
+            else:
+                m = b["goods_food"] * (1 + total_mod) + b["food_mod"] * base_food
+            if m > best_val:
+                best_val = m
+                best_name = b["name"]
+
+        if best_name is None:
+            break
+
+        if best_name == "_rgo":
+            n_rgo += 1
+        else:
+            lvls[best_name] += 1
+            b_data = next(b for b in buildings if b["name"] == best_name)
+            if b_data["rgo_output_mod"] > 0:
+                rgo_mod += b_data["rgo_output_mod"]
+            if best_name not in first_built:
+                first_built[best_name] = n_rgo
+
+        sequence.append((best_name, n_rgo, dict(lvls)))
+
+        if n_rgo >= max_rgo and all(lvls[b["name"]] >= b["max_levels"] for b in buildings):
+            break
+
+    # Extract phases using cumulative totals for clarity
+    # First, build raw phases: each entry is (action, rgo_level, building_totals)
+    raw = []
+    i = 0
+    while i < len(sequence):
+        name = sequence[i][0]
+        if name == "_rgo":
+            j = i
+            while j < len(sequence) and sequence[j][0] == "_rgo":
+                j += 1
+            raw.append(("_rgo", sequence[j - 1][1], dict(sequence[j - 1][2])))
+            i = j
+        else:
+            j = i
+            while j < len(sequence) and sequence[j][0] == name:
+                j += 1
+            total = sequence[j - 1][2][name]
+            raw.append((name, sequence[j - 1][1], total))
+            i = j
+
+    # Detect alternating RGO/building patterns and compress
+    phases = []
+    i = 0
+    while i < len(raw):
+        entry = raw[i]
+
+        if entry[0] == "_rgo":
+            # Look ahead for alternating RGO > Building > RGO > Building
+            if i + 1 < len(raw) and raw[i + 1][0] != "_rgo":
+                bld_name = raw[i + 1][0]
+                j = i
+                alt_count = 0
+                while (j + 1 < len(raw)
+                       and raw[j][0] == "_rgo"
+                       and raw[j + 1][0] == bld_name):
+                    # Check it's single-level increments
+                    prev_total = raw[j - 1][2] if j > 0 and raw[j - 1][0] == bld_name else 0
+                    if isinstance(raw[j + 1][2], int) and raw[j + 1][2] - (prev_total if isinstance(prev_total, int) else 0) == 1:
+                        alt_count += 1
+                        j += 2
+                    else:
+                        break
+
+                if alt_count >= 3:
+                    start_rgo = entry[1]
+                    end_rgo = raw[j - 2][1]
+                    label = labels.get(bld_name, bld_name)
+                    phases.append(f"alternate RGO/{label} from RGO {start_rgo} to {end_rgo}")
+                    i = j
+                    continue
+
+            phases.append(f"RGO to {entry[1]}")
+            i += 1
+        else:
+            name, rgo_at, total = entry
+            label = labels.get(name, name)
+            phases.append(f"{label} to {total}")
+            i += 1
+
+    # Merge trailing buildings after max RGO
+    tail = []
+    while phases and not phases[-1].startswith("RGO") and not phases[-1].startswith("alternate"):
+        tail.insert(0, phases.pop())
+    if tail:
+        phases.append("then " + ", ".join(tail))
+
+    return first_built, phases
+
+
+def build_food_compound_order(wb, food_goods, food_buildings):
+    """Compound build order: accounts for modifier interactions between buildings."""
+    ws = wb.create_sheet("Compound Build Order")
+
+    ws.cell(row=1, column=1, value="Compound Food Build Order by RGO").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Simulates greedy optimization: at each step, build whichever gives the most "
+                  "marginal food (accounting for how modifiers boost each other). "
+                  "Building caps scale with RGO. Skip unavailable buildings.").font = SUBTITLE_FONT
+
+    bld_names = [b for b in FOOD_BUILDING_ORDER
+                 if b in food_buildings and b not in ("market_village", "elephant_hunting_grounds")]
+
+    MAX_SLOTS = len(bld_names)
+    MAX_RGO = 40  # simulation limit
+
+    fixed_headers = ["RGO", "RGO\nFood/Lvl"]
+    slot_headers = []
+    for i in range(1, MAX_SLOTS + 1):
+        slot_headers.extend([
+            f"#{i} Building",
+            f"#{i} Build After\n(RGO lvl)",
+            f"#{i} Food/Lvl",
+            f"#{i} Requires",
+        ])
+
+    tail_headers = ["Build Pattern"]
+    all_headers = fixed_headers + slot_headers + tail_headers
+    header_row = 4
+    for i, h in enumerate(all_headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(all_headers))
+
+    sorted_goods = sorted(food_goods.items(), key=lambda x: -x[1]["food_value"])
+
+    row = header_row + 1
+    for rgo_name, rgo_data in sorted_goods:
+        rgo_fv = rgo_data["food_value"]
+
+        # Build simulation input for compatible buildings
+        sim_buildings = []
+        for bld_name in bld_names:
+            bld = food_buildings[bld_name]
+            req_rgos = bld.get("requirements", {}).get("rgo", [])
+            if req_rgos and rgo_name not in req_rgos:
+                continue
+
+            goods_f, mod_f, flat_f, rgo_note = calc_building_food(bld, food_goods)
+            rgo_out_mod = 0.0
+            if rgo_note:
+                # Extract the modifier for this specific RGO good
+                rgo_mods = bld.get("rgo_output_modifiers", {})
+                rgo_out_mod = rgo_mods.get(rgo_name, 0)
+
+            ml = bld.get("max_levels", 1)
+            # Fixed caps (windmill=1, canal=1) stay fixed;
+            # scaling caps (rural_building_cap, irrigant_cap) track RGO
+            max_lvl = ml if isinstance(ml, int) else MAX_RGO
+
+            sim_buildings.append({
+                "name": bld_name,
+                "goods_food": goods_f + flat_f,
+                "food_mod": mod_f,
+                "rgo_output_mod": rgo_out_mod,
+                "max_levels": max_lvl,
+            })
+
+        # Run simulation
+        first_built, phases = _simulate_compound_build_order(rgo_fv, sim_buildings)
+
+        # Build display entries sorted by compound crossover
+        entries = []
+        for b in sim_buildings:
+            bld_name = b["name"]
+            bld = food_buildings[bld_name]
+            label = FOOD_BUILDING_LABELS.get(bld_name, bld_name)
+            goods_f, mod_f, flat_f, rgo_note = calc_building_food(bld, food_goods)
+            constant = goods_f + flat_f
+
+            compound_after = first_built.get(bld_name)
+            if compound_after is None:
+                build_after = "after max RGO"
+                sort_val = 10000
+            else:
+                build_after = compound_after
+                sort_val = compound_after
+
+            if rgo_note:
+                food_display = rgo_note
+            elif constant > 0 and mod_f > 0:
+                food_display = f"{constant:.1f} + {mod_f:.0%}/lvl"
+            elif constant > 0:
+                food_display = f"{constant:.1f}"
+            elif mod_f > 0:
+                food_display = f"{mod_f:.0%}/lvl"
+            else:
+                food_display = f"{constant:.1f}"
+
+            reqs = bld.get("requirements", {})
+            req_parts = []
+            if reqs.get("vegetation"):
+                req_parts.append("veg: " + ", ".join(reqs["vegetation"]))
+            if reqs.get("features"):
+                req_parts.append(", ".join(reqs["features"]))
+            requires = "; ".join(req_parts) if req_parts else "any"
+
+            entries.append({
+                "label": label,
+                "build_after": build_after,
+                "food_display": food_display,
+                "requires": requires,
+                "sort_val": (sort_val, -constant),
+            })
+
+        entries.sort(key=lambda x: x["sort_val"])
+
+        # Write row
+        ws.cell(row=row, column=1, value=rgo_name).border = THIN_BORDER
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        ws.cell(row=row, column=2, value=rgo_fv).border = THIN_BORDER
+
+        col = 3
+        for e in entries:
+            ws.cell(row=row, column=col, value=e["label"]).border = THIN_BORDER
+            ws.cell(row=row, column=col + 1, value=e["build_after"]).border = THIN_BORDER
+            ws.cell(row=row, column=col + 2, value=e["food_display"]).border = THIN_BORDER
+            ws.cell(row=row, column=col + 3, value=e["requires"]).border = THIN_BORDER
+            col += 4
+
+        # Build Pattern column (fixed position matching header)
+        pattern_col = len(fixed_headers) + MAX_SLOTS * 4 + 1
+        pattern_str = " > ".join(phases)
+        ws.cell(row=row, column=pattern_col, value=pattern_str).border = THIN_BORDER
+
+        row += 1
+
+    auto_width(ws, max_width=80)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+
 def main():
     if not DATA_DIR.exists():
         print("No data/ directory found. Run scraper.py first.")
         return
 
-    land_units, categories, age_progression, prices, combined_arms, goods_demands, production_recipes, localizations, naval_units = load_data()
+    (land_units, categories, age_progression, prices, combined_arms,
+     goods_demands, production_recipes, localizations, naval_units,
+     food_goods, food_buildings, building_caps, terrain_food_modifiers) = load_data()
 
     global LOC
     LOC = localizations
 
     wb = Workbook()
 
-    print("Building Army Meta sheet...")
+    print("Building Unit Power sheet...")
     build_army_meta(wb, age_progression, categories, prices)
 
     print("Building Buildable Units sheet...")
     build_buildable_units(wb, land_units, categories, prices)
+
+    print("Building Levy Units sheet...")
+    build_levy_units(wb, land_units, categories, prices)
 
     print("Building Optimal Composition sheet...")
     build_optimal_composition(wb, land_units, categories, combined_arms)
@@ -2754,6 +3831,9 @@ def main():
 
     print("Building Upgrade Chains sheet...")
     build_upgrade_chains(wb, land_units, categories, prices)
+
+    print("Building Levy Upgrade Chains sheet...")
+    build_levy_upgrade_chains(wb, land_units, categories, prices)
 
     print("Building Category Stats sheet...")
     build_category_reference(wb, categories, prices)
@@ -2796,8 +3876,29 @@ def main():
     # Remove the placeholder sheet
     navy_wb.remove(navy_ws)
 
+    # --- Food workbook (separate file) ---
+    food_wb = Workbook()
+    food_ws = food_wb.active
+    food_ws.title = "placeholder"
+
+    print("Building Food Reference sheet...")
+    build_food_reference(food_wb, food_goods, food_buildings, building_caps, terrain_food_modifiers)
+
+    print("Building Food Location Buildup sheet...")
+    build_food_location_buildup(food_wb, food_goods, food_buildings, building_caps, terrain_food_modifiers)
+
+    print("Building Build Order by RGO sheet...")
+    build_food_build_order_by_rgo(food_wb, food_goods, food_buildings)
+
+    print("Building Compound Build Order sheet...")
+    build_food_compound_order(food_wb, food_goods, food_buildings)
+
+    # Remove placeholder
+    food_wb.remove(food_ws)
+
     army_path = OUTPUT_DIR / "eu5_army_analysis.xlsx"
     navy_path = OUTPUT_DIR / "eu5_navy_analysis.xlsx"
+    food_path = OUTPUT_DIR / "eu5_food_analysis.xlsx"
 
     # Close Excel if it has our files open
     if sys.platform == "win32":
@@ -2814,10 +3915,14 @@ def main():
     navy_wb.save(navy_path)
     print(f"Saved to: {navy_path}")
 
-    # Open both in Excel
+    food_wb.save(food_path)
+    print(f"Saved to: {food_path}")
+
+    # Open all in Excel
     if sys.platform == "win32":
         os.startfile(army_path)
         os.startfile(navy_path)
+        os.startfile(food_path)
 
 
 if __name__ == "__main__":

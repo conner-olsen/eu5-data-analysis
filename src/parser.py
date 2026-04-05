@@ -121,6 +121,13 @@ def parse_block(tokens: list[str], pos: int) -> tuple[dict, int]:
         else:
             value = _parse_value(tokens[pos])
             pos += 1
+            # Handle composite values like "rgb { 242 242 111 }"
+            if pos < len(tokens) and tokens[pos] == "{":
+                pos += 1  # skip opening brace
+                block, pos = parse_block(tokens, pos)
+                if pos < len(tokens) and tokens[pos] == "}":
+                    pos += 1  # skip closing brace
+                value = {str(value): block}
 
         # For non-= operators, store as a special dict
         if op != "=":

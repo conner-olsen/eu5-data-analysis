@@ -460,6 +460,318 @@ def scrape_combined_arms() -> dict:
     }
 
 
+def scrape_food_goods() -> dict:
+    """Scrape all goods that have a food value.
+
+    Returns: { "wheat": {"food_value": 8.0, "method": "farming", "price": 1.0}, ... }
+    """
+    raw = parse_directory(COMMON_DIR / "goods")
+    result = {}
+    for name, data in raw.items():
+        if not isinstance(data, dict):
+            continue
+        food_val = data.get("food")
+        if food_val is not None and isinstance(food_val, (int, float)):
+            result[name] = {
+                "food_value": food_val,
+                "method": data.get("method", ""),
+                "price": data.get("default_market_price", 1.0),
+            }
+    return result
+
+
+def _extract_location_potential(pot: dict) -> dict:
+    """Extract building requirements from a location_potential block.
+
+    Returns dict with keys: rgo (list), vegetation (list), features (list like
+    'is_coastal', 'has_river'), development_min (int or None).
+    """
+    reqs = {"rgo": [], "vegetation": [], "features": [], "development_min": None}
+    if not isinstance(pot, dict):
+        return reqs
+
+    def walk(block):
+        if not isinstance(block, dict):
+            return
+        for k, v in block.items():
+            if k == "raw_material":
+                vals = v if isinstance(v, list) else [v]
+                for val in vals:
+                    if isinstance(val, str):
+                        reqs["rgo"].append(val.replace("goods:", ""))
+            elif k == "vegetation":
+                vals = v if isinstance(v, list) else [v]
+                for val in vals:
+                    if isinstance(val, str):
+                        reqs["vegetation"].append(val)
+            elif k in ("is_coastal", "has_river", "is_adjacent_to_lake") and v is True:
+                reqs["features"].append(k)
+            elif k == "development":
+                if isinstance(v, dict) and v.get("__op__") == ">=" and isinstance(v.get("__value__"), (int, float)):
+                    reqs["development_min"] = v["__value__"]
+                elif isinstance(v, (int, float)):
+                    reqs["development_min"] = v
+            elif k == "OR":
+                sub = v if isinstance(v, list) else [v]
+                for s in sub:
+                    walk(s)
+            elif isinstance(v, dict):
+                walk(v)
+
+    walk(pot)
+    return reqs
+
+
+def scrape_food_buildings() -> dict:
+    """Scrape buildings relevant to food production from building_types.
+
+    Returns dict keyed by building name with requirements, production, and modifiers.
+    """
+    food_goods_data = scrape_food_goods()
+    food_good_names = set(food_goods_data.keys())
+    building_dir = COMMON_DIR / "building_types"
+
+    # Only parse files that contain food-relevant buildings
+    target_files = ["rural_buildings.txt", "common_buildings.txt"]
+    result = {}
+
+    # Food-related modifier keys we care about
+    FOOD_MODIFIER_KEYS = {
+        "local_monthly_food_modifier",
+        "local_monthly_food",
+        "local_food_capacity",
+    }
+
+    for filename in target_files:
+        filepath = building_dir / filename
+        if not filepath.exists():
+            continue
+        raw = parse_file(filepath)
+
+        for bld_name, bld_data in raw.items():
+            if not isinstance(bld_data, dict):
+                continue
+            if bld_data.get("is_special") is True:
+                continue
+
+            # Check if this building is food-relevant:
+            # 1) produces a food good, 2) has food modifiers, 3) has rgo output modifiers for food goods
+            produces = None
+            food_mods = {}
+            rgo_output_mods = {}
+            inputs = {}
+
+            # Check production methods
+            upm = bld_data.get("unique_production_methods", {})
+            if isinstance(upm, dict):
+                upm_list = [upm]
+            elif isinstance(upm, list):
+                upm_list = upm
+            else:
+                upm_list = []
+
+            for methods_block in upm_list:
+                if not isinstance(methods_block, dict):
+                    continue
+                for method_name, method_data in methods_block.items():
+                    if not isinstance(method_data, dict):
+                        continue
+                    produced = method_data.get("produced")
+                    output_amt = method_data.get("output")
+                    if produced and produced in food_good_names and output_amt:
+                        produces = {"good": produced, "output_per_level": output_amt}
+                    # Collect inputs for this method
+                    skip = {"produced", "output", "category", "debug_max_profit"}
+                    for k, v in method_data.items():
+                        if k not in skip and isinstance(v, (int, float)):
+                            inputs[k] = v
+
+            # Check modifiers
+            modifier = bld_data.get("modifier", {})
+            if isinstance(modifier, dict):
+                for key in FOOD_MODIFIER_KEYS:
+                    if key in modifier:
+                        food_mods[key] = modifier[key]
+                # Check for rgo output modifiers (e.g., local_wheat_output_modifier)
+                for k, v in modifier.items():
+                    if k.startswith("local_") and k.endswith("_output_modifier"):
+                        good_name = k[len("local_"):-len("_output_modifier")]
+                        if good_name in food_good_names:
+                            rgo_output_mods[good_name] = v
+
+            # Only include if food-relevant
+            if not produces and not food_mods and not rgo_output_mods:
+                continue
+
+            # Extract requirements
+            pot = bld_data.get("location_potential", {})
+            reqs = _extract_location_potential(pot)
+
+            # Check development requirement from top-level 'allow' block too
+            allow = bld_data.get("allow", {})
+            if isinstance(allow, dict):
+                dev_req = allow.get("development")
+                if isinstance(dev_req, dict) and dev_req.get("__op__") == ">=" :
+                    reqs["development_min"] = dev_req.get("__value__")
+
+            # Max levels
+            max_levels = bld_data.get("max_levels", 1)
+
+            # Location rank availability
+            ranks = []
+            for rank in ["rural_settlement", "town", "city"]:
+                if bld_data.get(rank) is True:
+                    ranks.append(rank)
+            if not ranks:
+                ranks = ["rural_settlement"]  # default for rural buildings
+
+            entry = {
+                "max_levels": max_levels,
+                "requirements": reqs,
+                "ranks": ranks,
+                "inputs": inputs if inputs else None,
+            }
+            if produces:
+                entry["produces"] = produces
+            if food_mods:
+                entry["food_modifiers"] = food_mods
+            if rgo_output_mods:
+                entry["rgo_output_modifiers"] = rgo_output_mods
+
+            result[bld_name] = entry
+
+    return result
+
+
+def scrape_building_caps() -> dict:
+    """Scrape building cap formulas for rural_building_cap and irrigant_cap.
+
+    Returns dict with numeric components for each cap.
+    """
+    filepath = COMMON_DIR / "script_values" / "building_caps.txt"
+    if not filepath.exists():
+        return {}
+    raw = parse_file(filepath)
+
+    caps = {}
+    for cap_name in ["rural_building_cap", "irrigant_cap"]:
+        data = raw.get(cap_name)
+        if not isinstance(data, dict):
+            continue
+        cap = {"base": 0, "per_development": 0, "per_max_rgo_workers": 0, "if_river": 0}
+
+        # The parser represents duplicate 'add' keys as a list
+        adds = data.get("add", [])
+        if isinstance(adds, dict):
+            adds = [adds]
+        elif not isinstance(adds, list):
+            adds = []
+
+        for add_block in adds:
+            if not isinstance(add_block, dict):
+                continue
+            value = add_block.get("value", 0)
+            multiply = add_block.get("multiply")
+            desc = add_block.get("desc", "")
+
+            if multiply is not None and isinstance(value, str):
+                # Scaled value: value = development/max_rgo_workers, multiply = factor
+                if value == "development":
+                    cap["per_development"] = multiply
+                elif value == "max_rgo_workers":
+                    cap["per_max_rgo_workers"] = multiply
+            elif isinstance(value, (int, float)) and multiply is None:
+                # Check if this is a base value (not inside a conditional)
+                if "BASE" in desc or (not cap["base"] and "RIVER" not in desc):
+                    cap["base"] = value
+
+        # Check for river bonus in 'if' blocks
+        if_block = data.get("if", {})
+        if isinstance(if_block, list):
+            if_blocks = if_block
+        else:
+            if_blocks = [if_block]
+
+        for ib in if_blocks:
+            if not isinstance(ib, dict):
+                continue
+            limit = ib.get("limit", {})
+            if isinstance(limit, dict) and limit.get("has_river") is True:
+                river_add = ib.get("add", {})
+                if isinstance(river_add, dict):
+                    cap["if_river"] = river_add.get("value", 0)
+                elif isinstance(river_add, (int, float)):
+                    cap["if_river"] = river_add
+
+        caps[cap_name] = cap
+
+    return caps
+
+
+def scrape_terrain_food_modifiers() -> dict:
+    """Scrape food modifiers from vegetation, topography, and location_ranks.
+
+    Returns dict with terrain categories and their food modifiers.
+    """
+    result = {}
+
+    # Vegetation
+    veg_raw = parse_directory(COMMON_DIR / "vegetation")
+    veg = {}
+    for name, data in veg_raw.items():
+        if not isinstance(data, dict):
+            continue
+        loc_mod = data.get("location_modifier", {})
+        if isinstance(loc_mod, dict):
+            food_mod = loc_mod.get("local_monthly_food_modifier")
+            if food_mod is not None:
+                veg[name] = {"local_monthly_food_modifier": food_mod}
+            else:
+                veg[name] = {}
+        else:
+            veg[name] = {}
+    result["vegetation"] = veg
+
+    # Topography (land only)
+    topo_raw = parse_directory(COMMON_DIR / "topography")
+    topo = {}
+    for name, data in topo_raw.items():
+        if not isinstance(data, dict):
+            continue
+        # Skip naval/wasteland topographies
+        if "ocean" in name or "lake" in name or "wasteland" in name or "narrows" in name or "salt_pans" in name or "atoll" in name or "inland_sea" in name:
+            continue
+        loc_mod = data.get("location_modifier", {})
+        if isinstance(loc_mod, dict):
+            food_mod = loc_mod.get("local_monthly_food_modifier")
+            if food_mod is not None:
+                topo[name] = {"local_monthly_food_modifier": food_mod}
+            else:
+                topo[name] = {}
+        else:
+            topo[name] = {}
+    result["topography"] = topo
+
+    # Location ranks
+    rank_raw = parse_directory(COMMON_DIR / "location_ranks")
+    ranks = {}
+    for name, data in rank_raw.items():
+        if not isinstance(data, dict):
+            continue
+        rank_mod = data.get("rank_modifier", {})
+        if isinstance(rank_mod, dict):
+            food_mod = rank_mod.get("local_monthly_food_modifier")
+            if food_mod is not None:
+                ranks[name] = {"local_monthly_food_modifier": food_mod}
+            else:
+                ranks[name] = {}
+        else:
+            ranks[name] = {}
+    result["location_ranks"] = ranks
+
+    return result
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -484,6 +796,18 @@ def main():
 
     print("Scraping combined arms defines...")
     combined_arms = scrape_combined_arms()
+
+    print("Scraping food goods...")
+    food_goods = scrape_food_goods()
+
+    print("Scraping food buildings...")
+    food_buildings = scrape_food_buildings()
+
+    print("Scraping building caps...")
+    building_caps = scrape_building_caps()
+
+    print("Scraping terrain food modifiers...")
+    terrain_food = scrape_terrain_food_modifiers()
 
     print("Parsing unit type files...")
     raw_units = parse_directory(COMMON_DIR / "unit_types")
@@ -550,6 +874,22 @@ def main():
     with open(OUTPUT_DIR / "age_progression.json", "w") as f:
         json.dump(age_progression, f, indent=2)
     print(f"  Wrote age_progression.json ({len(age_progression)} rows)")
+
+    with open(OUTPUT_DIR / "food_goods.json", "w") as f:
+        json.dump(food_goods, f, indent=2)
+    print(f"  Wrote food_goods.json ({len(food_goods)} goods)")
+
+    with open(OUTPUT_DIR / "food_buildings.json", "w") as f:
+        json.dump(food_buildings, f, indent=2)
+    print(f"  Wrote food_buildings.json ({len(food_buildings)} buildings)")
+
+    with open(OUTPUT_DIR / "building_caps.json", "w") as f:
+        json.dump(building_caps, f, indent=2)
+    print(f"  Wrote building_caps.json ({len(building_caps)} caps)")
+
+    with open(OUTPUT_DIR / "terrain_food_modifiers.json", "w") as f:
+        json.dump(terrain_food, f, indent=2)
+    print(f"  Wrote terrain_food_modifiers.json")
 
     print("Done!")
 
