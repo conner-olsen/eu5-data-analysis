@@ -3895,7 +3895,7 @@ def _run_full_simulation(allocator_fn, rgo_fv, sim_buildings, months=1200,
     Dev growth: ~0.004/mo from prosperity × (1 + road 5% + farmland 10% + river 5%)
     """
     RURAL_GROWTH = 0.001         # annual +0.1%
-    PROSPERITY_GROWTH = 0.005    # annual +0.5%
+    PROSPERITY_GROWTH = 0.0005   # annual +0.05%
     FOOD_GROWTH_PER_12 = 0.0008  # annual +0.08% per 12 months stored
     FOOD_GROWTH_CAP_MULT = 10    # max 10× base from food
     FREE_LAND_GROWTH = 0.0025    # annual +0.25% at full free land
