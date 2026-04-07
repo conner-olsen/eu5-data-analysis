@@ -3781,6 +3781,447 @@ def build_food_compound_order(wb, food_goods, food_buildings):
     ws.freeze_panes = f"A{header_row + 1}"
 
 
+def _greedy_allocate(budget, rgo_fv, buildings):
+    """Allocate a fixed number of build levels optimally using greedy marginal.
+
+    budget: total levels to allocate across RGO + buildings.
+    Returns (n_rgo, rgo_mod, lvls_dict, food_production, food_capacity, total_food_mod).
+    """
+    n_rgo = 0
+    rgo_mod = 0.0
+    lvls = {b["name"]: 0 for b in buildings}
+    BASE_FOOD_CAP = 50  # rural settlement base
+
+    for _ in range(budget):
+        # Current state
+        base_food = n_rgo * rgo_fv * (1 + rgo_mod)
+        for b in buildings:
+            base_food += lvls[b["name"]] * b["goods_food"]
+        total_mod = sum(lvls[b["name"]] * b["food_mod"] for b in buildings)
+
+        best_val = -1
+        best_name = None
+
+        # RGO
+        m = rgo_fv * (1 + rgo_mod) * (1 + total_mod)
+        if m > best_val:
+            best_val = m
+            best_name = "_rgo"
+
+        # Buildings
+        for b in buildings:
+            if b["rgo_output_mod"] > 0 and lvls[b["name"]] == 0:
+                m = b["rgo_output_mod"] * n_rgo * rgo_fv * (1 + total_mod)
+            elif b["max_levels"] is not None and lvls[b["name"]] >= b["max_levels"]:
+                continue
+            else:
+                m = b["goods_food"] * (1 + total_mod) + b["food_mod"] * base_food
+            if m > best_val:
+                best_val = m
+                best_name = b["name"]
+
+        if best_name == "_rgo":
+            n_rgo += 1
+        elif best_name:
+            lvls[best_name] += 1
+            b_data = next(b for b in buildings if b["name"] == best_name)
+            if b_data["rgo_output_mod"] > 0:
+                rgo_mod += b_data["rgo_output_mod"]
+
+    # Compute final food production
+    base_food = n_rgo * rgo_fv * (1 + rgo_mod)
+    for b in buildings:
+        base_food += lvls[b["name"]] * b["goods_food"]
+    total_mod = sum(lvls[b["name"]] * b["food_mod"] for b in buildings)
+    food_production = base_food * (1 + total_mod)
+
+    # Food capacity
+    food_cap = BASE_FOOD_CAP
+    for b in buildings:
+        food_cap += lvls[b["name"]] * b.get("food_capacity", 0)
+
+    return n_rgo, rgo_mod, lvls, food_production, food_cap, total_mod
+
+
+def _calc_rgo_max(dev, pops_units):
+    """RGO max levels: (2 + 0.025×pop_in_thousands + 0.1×dev) × (1 + 1.0 rural rank).
+
+    Ignoring literacy for simplicity.
+    """
+    base = 2 + 0.025 * pops_units + 0.1 * dev
+    return int(base * 2)  # ×2 from rural_settlement +100%
+
+
+def _calc_rural_building_cap(dev, rgo_max, has_river):
+    """rural_building_cap = 1 + 0.1×dev + 0.5×max_rgo_workers + river."""
+    cap = 1 + 0.1 * dev + 0.5 * rgo_max
+    if has_river:
+        cap += 1
+    return int(cap)
+
+
+def _calc_irrigant_cap(dev, has_river):
+    """irrigant_cap = 2 + 0.2×dev + 2 if river."""
+    cap = 2 + 0.2 * dev
+    if has_river:
+        cap += 2
+    return int(cap)
+
+
+def _calc_pop_capacity(dev, irr_levels):
+    """Population capacity for wheat/farmland/flatland/oceanic/river location.
+
+    Base: 100K (farmland)
+    Multipliers: oceanic +100%, river +10%, dev +2.5%/dev, traditional economy +22.5%
+    Additive: irrigation +1K/level, equator ~2.7K (fixed estimate)
+    """
+    base = 100 + 2.7 + irr_levels * 1.0  # in thousands
+    mult = 1 + 1.0 + 0.1 + 0.025 * dev + 0.225  # oceanic + river + dev + trad economy
+    return base * mult
+
+
+def _run_full_simulation(allocator_fn, rgo_fv, sim_buildings, months=1200,
+                         start_pops=5.0, start_dev=5.0, has_river=True):
+    """Run monthly simulation with co-evolving dev, pops, and building caps.
+
+    Scenario: wheat, farmland, flatland, oceanic, river, rural settlement.
+
+    Growth sources (annual rates, applied monthly as rate/12):
+    - Rural settlement: +0.1%
+    - Prosperity (scaled, ~half): +0.1%
+    - Food storage: +0.08% per 12 months stored (capped at 10× base)
+    - Free land: +0.25% × (1 - pops/pop_capacity)
+
+    Dev growth: ~0.004/mo from prosperity × (1 + road 5% + farmland 10% + river 5%)
+    """
+    RURAL_GROWTH = 0.001         # annual +0.1%
+    PROSPERITY_GROWTH = 0.005    # annual +0.5%
+    FOOD_GROWTH_PER_12 = 0.0008  # annual +0.08% per 12 months stored
+    FOOD_GROWTH_CAP_MULT = 10    # max 10× base from food
+    FREE_LAND_GROWTH = 0.0025    # annual +0.25% at full free land
+    FOOD_DECAY = 0.005           # 0.5%/mo on stored food
+    POP_CONSUMPTION = 1.0        # per 1K pops per month
+    # Dev growth: prosperity base ~0.004/mo × (1 + 0.05 road + 0.10 farmland + 0.05 river)
+    DEV_GROWTH_PER_MONTH = 0.004 * 1.20
+    BASE_FOOD_CAP = 50           # rural settlement base
+
+    pops = start_pops
+    dev = start_dev
+    food_stored = 0.0
+    cumulative_food = 0.0
+    yearly = []
+
+    for month in range(1, months + 1):
+        # Derive caps
+        rgo_max = _calc_rgo_max(dev, pops)
+        rural_cap = _calc_rural_building_cap(dev, rgo_max, has_river)
+        irr_cap = _calc_irrigant_cap(dev, has_river)
+
+        caps = {}
+        for b in sim_buildings:
+            if b["name"] == "irrigation_systems":
+                caps[b["name"]] = irr_cap
+            elif b["max_levels"] is not None:
+                caps[b["name"]] = b["max_levels"]
+            else:
+                caps[b["name"]] = rural_cap
+
+        pop_budget = max(int(pops), 1)
+
+        n_rgo, rgo_mod, lvls, food_prod, food_cap_bld, total_mod = allocator_fn(
+            pop_budget, rgo_fv, sim_buildings, rgo_max, caps
+        )
+
+        # Food capacity
+        food_cap = BASE_FOOD_CAP
+        for b in sim_buildings:
+            food_cap += lvls[b["name"]] * b.get("food_capacity", 0)
+
+        # Food storage
+        food_consumption = pops * POP_CONSUMPTION
+        surplus = food_prod - food_consumption
+        food_stored = food_stored * (1 - FOOD_DECAY) + surplus
+        food_stored = max(0, min(food_stored, food_cap))
+        months_stored = food_stored / food_consumption if food_consumption > 0 else 0
+
+        # Population capacity
+        irr_levels = lvls.get("irrigation_systems", 0)
+        pop_cap = _calc_pop_capacity(dev, irr_levels)
+
+        # Annual growth rate (applied monthly as /12)
+        base_annual = RURAL_GROWTH + PROSPERITY_GROWTH
+        food_bonus = min(FOOD_GROWTH_PER_12 * months_stored / 12,
+                         base_annual * FOOD_GROWTH_CAP_MULT)
+        free_land_ratio = max(0, (pop_cap - pops) / pop_cap) if pop_cap > 0 else 0
+        free_land_bonus = FREE_LAND_GROWTH * free_land_ratio
+        growth_rate = base_annual + food_bonus + free_land_bonus
+
+        # Apply monthly, cap at population capacity
+        new_pops = pops + pops * growth_rate / 12
+        if new_pops > pop_cap:
+            new_pops = max(pops, pop_cap)
+        pops = new_pops
+
+        dev += DEV_GROWTH_PER_MONTH
+        cumulative_food += food_prod
+
+        if month % 12 == 0:
+            yearly.append({
+                "year": month // 12,
+                "pops": pops,
+                "dev": dev,
+                "rgo_max": rgo_max,
+                "rural_cap": rural_cap,
+                "irr_cap": irr_cap,
+                "pop_cap": pop_cap,
+                "n_rgo": n_rgo,
+                "farming_village": lvls.get("farming_village", 0),
+                "windmill": lvls.get("windmill", 0),
+                "irrigation": lvls.get("irrigation_systems", 0),
+                "sheep_farms": lvls.get("sheep_farms", 0),
+                "fruit_orchard": lvls.get("fruit_orchard", 0),
+                "food_prod": food_prod,
+                "food_cap": food_cap,
+                "months_stored": months_stored,
+                "growth_rate": growth_rate,
+                "cumulative_food": cumulative_food,
+            })
+
+    return yearly
+
+
+def _capped_greedy_allocate(pop_budget, rgo_fv, buildings, rgo_max, caps):
+    """Greedy allocation respecting both pop budget and per-building caps."""
+    n_rgo = 0
+    rgo_mod = 0.0
+    lvls = {b["name"]: 0 for b in buildings}
+    used = 0
+
+    for _ in range(pop_budget):
+        base_food = n_rgo * rgo_fv * (1 + rgo_mod)
+        for b in buildings:
+            base_food += lvls[b["name"]] * b["goods_food"]
+        total_mod = sum(lvls[b["name"]] * b["food_mod"] for b in buildings)
+
+        best_val = -1
+        best_name = None
+
+        # RGO
+        if n_rgo < rgo_max:
+            m = rgo_fv * (1 + rgo_mod) * (1 + total_mod)
+            if m > best_val:
+                best_val = m
+                best_name = "_rgo"
+
+        for b in buildings:
+            bld_cap = caps.get(b["name"], 0)
+            if lvls[b["name"]] >= bld_cap:
+                continue
+            if b["rgo_output_mod"] > 0 and lvls[b["name"]] == 0:
+                m = b["rgo_output_mod"] * n_rgo * rgo_fv * (1 + total_mod)
+            else:
+                m = b["goods_food"] * (1 + total_mod) + b["food_mod"] * base_food
+            if m > best_val:
+                best_val = m
+                best_name = b["name"]
+
+        if best_name is None:
+            break
+        if best_name == "_rgo":
+            n_rgo += 1
+        else:
+            lvls[best_name] += 1
+            bd = next(b for b in buildings if b["name"] == best_name)
+            if bd["rgo_output_mod"] > 0:
+                rgo_mod += bd["rgo_output_mod"]
+        used += 1
+
+    # Compute food production
+    base_food = n_rgo * rgo_fv * (1 + rgo_mod)
+    for b in buildings:
+        base_food += lvls[b["name"]] * b["goods_food"]
+    total_mod = sum(lvls[b["name"]] * b["food_mod"] for b in buildings)
+    food_prod = base_food * (1 + total_mod)
+
+    food_cap = 50
+    for b in buildings:
+        food_cap += lvls[b["name"]] * b.get("food_capacity", 0)
+
+    return n_rgo, rgo_mod, lvls, food_prod, food_cap, total_mod
+
+
+def _capped_farming_first_allocate(pop_budget, rgo_fv, buildings, rgo_max, caps):
+    """Farming-first allocation respecting building caps."""
+    n_rgo = 0
+    rgo_mod = 0.0
+    lvls = {b["name"]: 0 for b in buildings}
+    remaining = pop_budget
+
+    fv_bld = next((b for b in buildings if b["name"] == "farming_village"), None)
+    wm_bld = next((b for b in buildings if b["name"] == "windmill"), None)
+
+    # 1. Max farming village (up to cap)
+    if fv_bld and remaining > 0:
+        fv_cap = caps.get("farming_village", 0)
+        fv_lvl = min(remaining, fv_cap)
+        lvls["farming_village"] = fv_lvl
+        remaining -= fv_lvl
+
+    # 2. Windmill
+    if wm_bld and remaining > 0 and caps.get("windmill", 0) >= 1:
+        lvls["windmill"] = 1
+        rgo_mod += wm_bld["rgo_output_mod"]
+        remaining -= 1
+
+    # 3. RGO with remaining (up to rgo_max)
+    rgo_lvl = min(remaining, rgo_max)
+    n_rgo = rgo_lvl
+    remaining -= rgo_lvl
+
+    # 4. Fill any remaining into irrigation, sheep, etc.
+    for b in buildings:
+        if remaining <= 0:
+            break
+        if b["name"] in ("farming_village", "windmill"):
+            continue
+        bld_cap = caps.get(b["name"], 0)
+        add = min(remaining, bld_cap - lvls[b["name"]])
+        if add > 0:
+            lvls[b["name"]] += add
+            remaining -= add
+
+    # Compute food
+    base_food = n_rgo * rgo_fv * (1 + rgo_mod)
+    for b in buildings:
+        base_food += lvls[b["name"]] * b["goods_food"]
+    total_mod = sum(lvls[b["name"]] * b["food_mod"] for b in buildings)
+    food_prod = base_food * (1 + total_mod)
+
+    food_cap = 50
+    for b in buildings:
+        food_cap += lvls[b["name"]] * b.get("food_capacity", 0)
+
+    return n_rgo, rgo_mod, lvls, food_prod, food_cap, total_mod
+
+
+def build_food_simulation(wb, food_goods, food_buildings):
+    """100-year simulation comparing optimal vs farming-first with real caps."""
+    ws = wb.create_sheet("100-Year Simulation")
+
+    ws.cell(row=1, column=1, value="100-Year Food Simulation: Optimal vs Farming-First (Wheat)").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Wheat, farmland, flatland, oceanic, river, rural settlement. 5k pops, dev 5. "
+                  "Growth: +0.1% rural + 0.1% prosperity + 0.25%×free_land + 0.08%/12mo stored. "
+                  "Pop cap ~240K+ (farmland+oceanic+river). Dev grows ~0.005/mo.").font = SUBTITLE_FONT
+
+    RGO_FV = 8.0
+
+    bld_names = [b for b in FOOD_BUILDING_ORDER
+                 if b in food_buildings and b not in ("market_village", "elephant_hunting_grounds")]
+
+    sim_buildings = []
+    for bld_name in bld_names:
+        bld = food_buildings[bld_name]
+        req_rgos = bld.get("requirements", {}).get("rgo", [])
+        if req_rgos and "wheat" not in req_rgos:
+            continue
+        goods_f, mod_f, flat_f, rgo_note = calc_building_food(bld, food_goods)
+        rgo_out = bld.get("rgo_output_modifiers", {}).get("wheat", 0)
+        ml = bld.get("max_levels", 1)
+        max_lvl = ml if isinstance(ml, int) else None
+        food_cap_val = bld.get("food_modifiers", {}).get("local_food_capacity", 0)
+
+        sim_buildings.append({
+            "name": bld_name,
+            "goods_food": goods_f + flat_f,
+            "food_mod": mod_f,
+            "rgo_output_mod": rgo_out,
+            "max_levels": max_lvl,
+            "food_capacity": food_cap_val,
+        })
+
+    # Run both strategies
+    optimal = _run_full_simulation(_capped_greedy_allocate, RGO_FV, sim_buildings)
+    fv_first = _run_full_simulation(_capped_farming_first_allocate, RGO_FV, sim_buildings)
+
+    # Write comparison
+    headers = [
+        "Year", "Dev",
+        "OPT\nPops", "OPT\nRGO", "OPT\nFarm Vil", "OPT\nWindmill", "OPT\nIrrigation",
+        "OPT\nFood/Mo", "OPT\nFood Cap", "OPT\nMo Stored", "OPT\nGrowth/Yr",
+        "OPT\nCum. Food",
+        "",
+        "FV1st\nPops", "FV1st\nRGO", "FV1st\nFarm Vil", "FV1st\nWindmill", "FV1st\nIrrigation",
+        "FV1st\nFood/Mo", "FV1st\nFood Cap", "FV1st\nMo Stored", "FV1st\nGrowth/Yr",
+        "FV1st\nCum. Food",
+        "",
+        "OPT\nAdvantage",
+    ]
+    header_row = 4
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(headers))
+
+    OPT_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    FV_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+
+    for r, (opt, fv1) in enumerate(zip(optimal, fv_first), header_row + 1):
+        adv = opt["cumulative_food"] - fv1["cumulative_food"]
+        adv_pct = adv / fv1["cumulative_food"] if fv1["cumulative_food"] > 0 else 0
+
+        opt_vals = [
+            opt["year"], round(opt["dev"], 1),
+            round(opt["pops"] * 1000),
+            opt["n_rgo"], opt["farming_village"], opt["windmill"], opt["irrigation"],
+            round(opt["food_prod"], 1), round(opt["food_cap"]),
+            round(opt["months_stored"], 1), opt["growth_rate"],
+            round(opt["cumulative_food"]),
+        ]
+        fv_vals = [
+            round(fv1["pops"] * 1000),
+            fv1["n_rgo"], fv1["farming_village"], fv1["windmill"], fv1["irrigation"],
+            round(fv1["food_prod"], 1), round(fv1["food_cap"]),
+            round(fv1["months_stored"], 1), fv1["growth_rate"],
+            round(fv1["cumulative_food"]),
+        ]
+
+        for i, v in enumerate(opt_vals, 1):
+            cell = ws.cell(row=r, column=i, value=v)
+            cell.border = THIN_BORDER
+            if i == 2:
+                cell.number_format = NUM_FMT_2
+            elif i == 11:
+                cell.number_format = "0.000%"
+            elif isinstance(v, float):
+                cell.number_format = NUM_FMT_2
+            if i >= 3:
+                cell.fill = OPT_FILL
+
+        ws.cell(row=r, column=13, value="").border = THIN_BORDER
+
+        for i, v in enumerate(fv_vals, 14):
+            cell = ws.cell(row=r, column=i, value=v)
+            cell.border = THIN_BORDER
+            cell.fill = FV_FILL
+            if i == 22:  # growth rate column
+                cell.number_format = "0.000%"
+            elif isinstance(v, float):
+                cell.number_format = NUM_FMT_2
+
+        ws.cell(row=r, column=25, value="").border = THIN_BORDER
+
+        cell = ws.cell(row=r, column=26, value=adv_pct)
+        cell.border = THIN_BORDER
+        cell.number_format = "+0.0%;-0.0%;0%"
+        if adv_pct > 0:
+            cell.font = Font(bold=True, color="008000")
+        elif adv_pct < 0:
+            cell.font = Font(bold=True, color="FF0000")
+
+    auto_width(ws)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+
 def main():
     if not DATA_DIR.exists():
         print("No data/ directory found. Run scraper.py first.")
@@ -3892,6 +4333,9 @@ def main():
 
     print("Building Compound Build Order sheet...")
     build_food_compound_order(food_wb, food_goods, food_buildings)
+
+    print("Building 100-Year Simulation sheet...")
+    build_food_simulation(food_wb, food_goods, food_buildings)
 
     # Remove placeholder
     food_wb.remove(food_ws)
