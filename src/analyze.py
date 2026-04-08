@@ -4222,6 +4222,289 @@ def build_food_simulation(wb, food_goods, food_buildings):
     ws.freeze_panes = f"A{header_row + 1}"
 
 
+def build_vassal_breakeven(wb):
+    """Break-even analysis for vassal annexation decisions.
+
+    Compares monthly income from keeping a vassal vs annexing at various
+    control levels, accounting for subject income rates and the economical
+    base increase that raises all slider costs.
+
+    Model (per unit of vassal monthly income V):
+      As vassal:  you receive income_rate × V
+      If annexed at control C:  you receive C × V, but slider costs rise
+      Break-even control = income_rate + slider_overhead
+    """
+    ws = wb.create_sheet("Vassal Break-Even")
+
+    # --------------- Game constants ---------------
+    ECON_TAX_WEIGHT = 0.5       # ECONOMICAL_BASE_FROM_TAX_BASE
+    ECON_SUBJ_WEIGHT = 0.05     # ECONOMICAL_BASE_FROM_SUBJECT
+    # Net econ base change when annexing (per unit vassal tax base):
+    #   gain 0.5 from direct ownership, lose 0.05*0.5 from dropping subject bonus
+    ECON_CHANGE = ECON_TAX_WEIGHT - ECON_SUBJ_WEIGHT * ECON_TAX_WEIGHT  # 0.475
+
+    SUBJECTS = [
+        # (name, scaled_gold, can_annex, min_years, min_opinion, stall_opinion)
+        ("Vassal",           0.20,  True,  10, 150, 125),
+        ("Fiefdom",          0.20,  True,  10, 150, 125),
+        ("March",            0.10,  False, None, None, None),
+        ("Tributary",        0.20,  False, None, None, None),
+        ("Samanta",          0.10,  True,  10, 150, 125),
+        ("Maha Samanta",     0.20,  True,  10, 150, 125),
+        ("P. Maha Samanta",  0.33,  True,  10, 150, 125),
+        ("Trade Company",    0.50,  False, None, None, None),
+        ("Colonial Nation",  0.025, False, None, None, None),
+        ("Hanseatic Member", 0.05,  False, None, None, None),
+        ("UC Bey",           0.05,  False, None, None, None),
+    ]
+
+    GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    YELLOW = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    RED = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    def _breakeven(income_rate, slider_spend_frac):
+        """Min control % for annexation to beat keeping the vassal.
+
+        income_rate:       fraction of vassal income you receive (e.g. 0.20)
+        slider_spend_frac: your monthly slider spend as fraction of income
+        Slider overhead = 0.95 × slider_spend_frac (econ base increase
+        makes all slider costs go up by that proportion).
+        """
+        return max(0, min(1, income_rate + 0.95 * slider_spend_frac))
+
+    row = 1
+
+    # ===== Title =====
+    ws.cell(row=row, column=1,
+            value="Vassal Annexation Break-Even Analysis").font = TITLE_FONT
+    row += 2
+
+    # ===== Section 1: Subject Income Rates =====
+    ws.cell(row=row, column=1, value="Subject Income Rates").font = SUBTITLE_FONT
+    ws.cell(row=row, column=4,
+            value="Source: in_game/common/prices/03_diplomacy.txt").font = Font(
+                italic=True, color="808080")
+    row += 1
+
+    s_headers = ["Subject Type", "Income Rate", "Annexable",
+                 "Min Years", "Min Opinion", "Stall Opinion"]
+    for i, h in enumerate(s_headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(s_headers))
+    row += 1
+
+    for name, rate, annex, years, opinion, stall in SUBJECTS:
+        vals = [name, rate, "Yes" if annex else "No",
+                years if years is not None else "-",
+                opinion if opinion is not None else "-",
+                stall if stall is not None else "-"]
+        for i, v in enumerate(vals, 1):
+            cell = ws.cell(row=row, column=i, value=v)
+            cell.border = THIN_BORDER
+            if i == 2 and isinstance(v, float):
+                cell.number_format = "0%"
+        row += 1
+
+    # ===== Section 2: Key Game Constants =====
+    row += 2
+    ws.cell(row=row, column=1, value="Key Game Constants").font = SUBTITLE_FONT
+    ws.cell(row=row, column=3,
+            value="Source: loading_screen/common/defines/00_defines.txt").font = Font(
+                italic=True, color="808080")
+    row += 1
+
+    constants = [
+        ("ECONOMICAL_BASE_FROM_TAX_BASE", 0.5),
+        ("ECONOMICAL_BASE_FROM_SUBJECT", 0.05),
+        ("STABILITY_INVEST_FACTOR", 0.5),
+        ("STABILIY_EXPENSE_FACTOR", 0.1),
+        ("LOW_CONTROL_THRESHOLD_FOR_BEST_TAX", 0.95),
+    ]
+
+    c_headers = ["Define", "Value"]
+    for i, h in enumerate(c_headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(c_headers))
+    row += 1
+
+    for name, val in constants:
+        for i, v in enumerate([name, val], 1):
+            cell = ws.cell(row=row, column=i, value=v)
+            cell.border = THIN_BORDER
+        row += 1
+
+    # ===== Section 3: Break-Even Model =====
+    row += 2
+    ws.cell(row=row, column=1, value="Break-Even Model").font = SUBTITLE_FONT
+    row += 1
+    notes = [
+        "All values expressed per 1 gold/month of vassal income (multiply by "
+        "vassal's actual monthly income for gold amounts).",
+        "As VASSAL:  you receive income_rate \u00d7 V  "
+        "(e.g. 20% \u00d7 V for vassal type)",
+        "If ANNEXED at control C:  you receive C \u00d7 V, but all slider "
+        "costs increase proportionally to your econ base growth",
+        "Break-even control = income_rate + 0.95 \u00d7 slider_spend_frac",
+        "slider_spend_frac = your monthly slider expenses / your monthly "
+        "income (e.g. 0.10 if 10% of income goes to sliders)",
+        "Econ base grows by ~0.95 \u00d7 (vassal/overlord economy ratio), "
+        "raising ALL gold-based costs by that %",
+        "Econ base increase is independent of economy ratio for the "
+        "break-even %, but ratio determines absolute gold amounts",
+    ]
+    for n in notes:
+        ws.cell(row=row, column=1, value=n).font = Font(italic=True, size=10)
+        row += 1
+
+    # ===== Section 4: Break-Even by Subject Type =====
+    row += 2
+    ws.cell(row=row, column=1,
+            value="Break-Even Control % by Subject Type").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Minimum average control in annexed land to beat vassal "
+            "income, at different slider spending levels."
+            ).font = Font(italic=True, size=10)
+    row += 1
+
+    annexable = [(n, r) for n, r, a, *_ in SUBJECTS if a]
+    slider_spends = [0.00, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50]
+
+    headers = ["Slider Spend\n(% of income)"] + [n for n, _ in annexable]
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(headers))
+    row += 1
+
+    for ss in slider_spends:
+        cell = ws.cell(row=row, column=1, value=ss)
+        cell.number_format = "0%"
+        cell.border = THIN_BORDER
+        for j, (_, rate) in enumerate(annexable, 2):
+            be = _breakeven(rate, ss)
+            cell = ws.cell(row=row, column=j)
+            cell.border = THIN_BORDER
+            cell.value = be
+            cell.number_format = "0%"
+            if be < 0.40:
+                cell.fill = GREEN
+            elif be < 0.70:
+                cell.fill = YELLOW
+            else:
+                cell.fill = RED
+        row += 1
+
+    # ===== Section 5: Monthly Slider Cost Increase =====
+    row += 2
+    ws.cell(row=row, column=1,
+            value="Monthly Slider Cost Increase from Annexation").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Shows how much your monthly slider expenses rise after "
+            "annexing, by vassal/overlord economy ratio and current slider "
+            "spending.  Values are gold/month per 1 gold of vassal income."
+            ).font = Font(italic=True, size=10)
+    row += 1
+
+    ratios2 = [0.10, 0.20, 0.30, 0.50, 0.75, 1.00]
+    slider_spends2 = [0.05, 0.10, 0.15, 0.20, 0.30, 0.50]
+
+    headers = ["Slider Spend\n(% of income)"] + [f"Ratio\n{r:.0%}" for r in ratios2]
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(headers))
+    row += 1
+
+    for ss in slider_spends2:
+        cell = ws.cell(row=row, column=1, value=ss)
+        cell.number_format = "0%"
+        cell.border = THIN_BORDER
+        for j, ratio in enumerate(ratios2, 2):
+            # Econ base increase = 0.95 × ratio, so slider costs rise by
+            # that fraction.  Extra gold/month = slider_spend × econ_increase
+            # Per unit vassal income: 0.95 × ratio × ss × (O/V) = 0.95 × ss
+            # (ratio cancels).  But absolute gold = 0.95 × ratio × ss × O.
+            # Here show per unit overlord income:
+            extra = 0.95 * ratio * ss
+            cell = ws.cell(row=row, column=j, value=extra)
+            cell.number_format = NUM_FMT_3
+            cell.border = THIN_BORDER
+        row += 1
+
+    # ===== Section 6: Net Income Comparison by Control Level =====
+    row += 2
+    ws.cell(row=row, column=1,
+            value="Monthly Net Income: Annex vs Keep").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="% of vassal income gained (+) or lost (-) by annexing.  "
+            "Slider spend = 10% of income."
+            ).font = Font(italic=True, size=10)
+    row += 1
+
+    control_levels = [0.05, 0.10, 0.15, 0.20, 0.30, 0.40,
+                      0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 1.00]
+    ref_ss = 0.10
+    # Slider overhead per unit V: 0.95 × slider_spend_frac
+    overhead = 0.95 * ref_ss
+
+    headers = ["Control"] + [n for n, _ in annexable]
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(headers))
+    row += 1
+
+    for C in control_levels:
+        cell = ws.cell(row=row, column=1, value=C)
+        cell.number_format = "0%"
+        cell.border = THIN_BORDER
+        for j, (_, rate) in enumerate(annexable, 2):
+            # You lose rate × V from vassal, gain C × V from control,
+            # pay overhead × V in higher slider costs
+            diff = (C - rate) - overhead
+            cell = ws.cell(row=row, column=j, value=diff)
+            cell.number_format = "+0%;-0%;0%"
+            cell.border = THIN_BORDER
+            if diff > 0.001:
+                cell.fill = GREEN
+            elif diff < -0.001:
+                cell.fill = RED
+            else:
+                cell.fill = YELLOW
+        row += 1
+
+    # ===== Section 7: Econ Base Impact =====
+    row += 2
+    ws.cell(row=row, column=1,
+            value="Economical Base Impact of Annexation").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Annexing adds 0.5\u00d7vassal_tax_base to your econ base, "
+            "minus the 0.05 lost subject contribution.  Net: +0.475 per unit "
+            "vassal tax base.  Econ base scales ALL gold-based slider costs."
+            ).font = Font(italic=True, size=10)
+    row += 1
+
+    e_headers = ["Economy\nRatio", "Your Econ Base\nIncrease",
+                 "Slider Cost\nIncrease"]
+    for i, h in enumerate(e_headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(e_headers))
+    row += 1
+
+    for ratio in [0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50, 2.00]:
+        # Econ base change as % of overlord's:
+        # 0.475 * T_v / (0.5 * T_o) = 0.95 * ratio
+        econ_pct = 0.95 * ratio
+        for i, v in enumerate([ratio, econ_pct, econ_pct], 1):
+            cell = ws.cell(row=row, column=i, value=v)
+            cell.border = THIN_BORDER
+            cell.number_format = "0%"
+        row += 1
+
+    auto_width(ws, max_width=50)
+
+
 def main():
     if not DATA_DIR.exists():
         print("No data/ directory found. Run scraper.py first.")
@@ -4340,9 +4623,21 @@ def main():
     # Remove placeholder
     food_wb.remove(food_ws)
 
+    # --- Economy workbook (separate file) ---
+    econ_wb = Workbook()
+    econ_ws = econ_wb.active
+    econ_ws.title = "placeholder"
+
+    print("Building Vassal Break-Even sheet...")
+    build_vassal_breakeven(econ_wb)
+
+    # Remove placeholder
+    econ_wb.remove(econ_ws)
+
     army_path = OUTPUT_DIR / "eu5_army_analysis.xlsx"
     navy_path = OUTPUT_DIR / "eu5_navy_analysis.xlsx"
     food_path = OUTPUT_DIR / "eu5_food_analysis.xlsx"
+    econ_path = OUTPUT_DIR / "eu5_economy_analysis.xlsx"
 
     # Close Excel if it has our files open
     if sys.platform == "win32":
@@ -4362,11 +4657,15 @@ def main():
     food_wb.save(food_path)
     print(f"Saved to: {food_path}")
 
+    econ_wb.save(econ_path)
+    print(f"Saved to: {econ_path}")
+
     # Open all in Excel
     if sys.platform == "win32":
         os.startfile(army_path)
         os.startfile(navy_path)
         os.startfile(food_path)
+        os.startfile(econ_path)
 
 
 if __name__ == "__main__":
