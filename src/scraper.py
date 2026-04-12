@@ -772,6 +772,27 @@ def scrape_terrain_food_modifiers() -> dict:
     return result
 
 
+def scrape_forts() -> list:
+    """Scrape fort buildings and their fort_level from building_types/forts.txt.
+
+    Returns list of dicts sorted by fort_level: [{name, fort_level}, ...]
+    """
+    filepath = COMMON_DIR / "building_types" / "forts.txt"
+    raw = parse_file(filepath)
+    forts = []
+    for name, data in raw.items():
+        if not isinstance(data, dict):
+            continue
+        raw_mod = data.get("raw_modifier", {})
+        if isinstance(raw_mod, dict) and "fort_level" in raw_mod:
+            forts.append({
+                "name": name,
+                "fort_level": raw_mod["fort_level"],
+            })
+    forts.sort(key=lambda f: f["fort_level"])
+    return forts
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -808,6 +829,9 @@ def main():
 
     print("Scraping terrain food modifiers...")
     terrain_food = scrape_terrain_food_modifiers()
+
+    print("Scraping forts...")
+    forts = scrape_forts()
 
     print("Parsing unit type files...")
     raw_units = parse_directory(COMMON_DIR / "unit_types")
@@ -890,6 +914,10 @@ def main():
     with open(OUTPUT_DIR / "terrain_food_modifiers.json", "w") as f:
         json.dump(terrain_food, f, indent=2)
     print(f"  Wrote terrain_food_modifiers.json")
+
+    with open(OUTPUT_DIR / "forts.json", "w") as f:
+        json.dump(forts, f, indent=2)
+    print(f"  Wrote forts.json ({len(forts)} fort buildings)")
 
     print("Done!")
 

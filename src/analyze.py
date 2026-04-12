@@ -97,9 +97,12 @@ def load_data():
         building_caps = json.load(f)
     with open(DATA_DIR / "terrain_food_modifiers.json") as f:
         terrain_food_modifiers = json.load(f)
+    with open(DATA_DIR / "forts.json") as f:
+        forts = json.load(f)
     return (land_units, categories, age_progression, prices, combined_arms,
             goods_demands, production_recipes, localizations, naval_units,
-            food_goods, food_buildings, building_caps, terrain_food_modifiers)
+            food_goods, food_buildings, building_caps, terrain_food_modifiers,
+            forts)
 
 
 LOC = {}  # populated in main(), used by loc() helper
@@ -825,6 +828,128 @@ CA_TYPES = [
     ("Artillery", "army_artillery", None),  # None = no light/heavy split
     ("Auxiliary", "army_auxiliary", None),
 ]
+
+
+def build_artillery_barrage(wb, land_units, forts):
+    """Sheet: Artillery barrage bonus requirements.
+
+    Shows how many artillery units of each type are needed to achieve each
+    barrage bonus level (+1..+8) against every fort at various strength levels.
+    Formula: CEILING(bonus / ((barrage * strength - fort_level) / 3), 1)
+    """
+    ws = wb.create_sheet("Artillery Barrage")
+
+    ws.cell(row=1, column=1, value="Artillery Barrage Requirements").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Units needed per barrage bonus level against forts at various strength levels"
+            ).font = SUBTITLE_FONT
+    ws.cell(row=3, column=1,
+            value="Formula: CEILING(bonus / ((barrage * strength - fort_level) / 3), 1)")
+
+    HEADER_ROW = 6
+    STRENGTHS = [1.0, 0.95, 0.90, 0.75]
+
+    # Collect unique barrage levels from artillery units, grouped by age
+    # Skip age 1 (no actual artillery exists in-game despite template)
+    barrage_by_age = {}  # age -> barrage value
+    units_by_barrage = {}  # barrage -> [unit_names]
+    for u in land_units:
+        if u["category"] != "army_artillery":
+            continue
+        if u.get("age") == "age_1_traditions":
+            continue
+        b = u.get("artillery_barrage", 0)
+        if b <= 0:
+            continue
+        age = u.get("age", "")
+        if age and age not in barrage_by_age:
+            barrage_by_age[age] = b
+        units_by_barrage.setdefault(b, []).append(loc(u["name"]))
+
+    # Build ordered list: (age_label, barrage)
+    barrage_rows = []
+    for age in AGE_ORDER:
+        if age in barrage_by_age:
+            barrage_rows.append((AGE_LABELS[age], barrage_by_age[age]))
+
+    # Alternating row fills by barrage group
+    fill_cycle = [
+        CAT_FILLS["Infantry"],   # light blue
+        CAT_FILLS["Cavalry"],    # light green
+        CAT_FILLS["Artillery"],  # light orange
+        CAT_FILLS["Auxiliary"],  # light gray
+    ]
+
+    # Header row
+    label_headers = ["Artillery", "Barrage", "Strength", "Fort", "Fort Level"]
+    for col_idx, h in enumerate(label_headers, 1):
+        ws.cell(row=HEADER_ROW, column=col_idx, value=h)
+    for i in range(8):
+        cell = ws.cell(row=HEADER_ROW, column=6 + i, value=i + 1)
+        cell.number_format = '"+"0'
+    style_header_row(ws, HEADER_ROW, 13)
+
+    # Data rows
+    row = HEADER_ROW + 1
+    for b_idx, (label, barrage) in enumerate(barrage_rows):
+        fill = fill_cycle[b_idx % len(fill_cycle)]
+
+        for fort in forts:
+            fort_name = loc(fort["name"])
+            fort_level = fort["fort_level"]
+
+            for strength in STRENGTHS:
+                # Skip rows where +1 bonus is impossible
+                if barrage * strength - fort_level <= 0:
+                    continue
+
+                ws.cell(row=row, column=1, value=label).fill = fill
+                ws.cell(row=row, column=1).border = THIN_BORDER
+
+                c = ws.cell(row=row, column=2, value=barrage)
+                c.fill = fill
+                c.alignment = Alignment(horizontal="center")
+                c.border = THIN_BORDER
+
+                c = ws.cell(row=row, column=3, value=strength)
+                c.fill = fill
+                c.alignment = Alignment(horizontal="center")
+                c.number_format = NUM_FMT_PCT
+                c.border = THIN_BORDER
+
+                c = ws.cell(row=row, column=4, value=fort_name)
+                c.fill = fill
+                c.border = THIN_BORDER
+
+                c = ws.cell(row=row, column=5, value=fort_level)
+                c.fill = fill
+                c.alignment = Alignment(horizontal="center")
+                c.border = THIN_BORDER
+
+                for i in range(8):
+                    col = 6 + i
+                    cl = get_column_letter(col)
+                    formula = (
+                        f'=CEILING({cl}${HEADER_ROW}/(($B{row}*$C{row}-$E{row})/3),1)'
+                    )
+                    c = ws.cell(row=row, column=col, value=formula)
+                    c.fill = fill
+                    c.alignment = Alignment(horizontal="center")
+                    c.border = THIN_BORDER
+
+                row += 1
+
+    # Unit reference section
+    row += 1
+    ws.cell(row=row, column=1, value="Units by Barrage Level").font = SUBTITLE_FONT
+    row += 1
+    for barrage in sorted(units_by_barrage):
+        ws.cell(row=row, column=1, value=f"Barrage {barrage}:").font = Font(bold=True)
+        ws.cell(row=row, column=2, value=", ".join(units_by_barrage[barrage]))
+        row += 1
+
+    ws.freeze_panes = "F7"
+    auto_width(ws)
 
 
 def get_best_generic_units(land_units, categories):
@@ -4512,7 +4637,8 @@ def main():
 
     (land_units, categories, age_progression, prices, combined_arms,
      goods_demands, production_recipes, localizations, naval_units,
-     food_goods, food_buildings, building_caps, terrain_food_modifiers) = load_data()
+     food_goods, food_buildings, building_caps, terrain_food_modifiers,
+     forts) = load_data()
 
     global LOC
     LOC = localizations
@@ -4564,6 +4690,9 @@ def main():
 
     print("Building Light vs Heavy sheet...")
     build_light_vs_heavy(wb, land_units, categories)
+
+    print("Building Artillery Barrage sheet...")
+    build_artillery_barrage(wb, land_units, forts)
 
     # --- Navy workbook (separate file) ---
     navy_wb = Workbook()
