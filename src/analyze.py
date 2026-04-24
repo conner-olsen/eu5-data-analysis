@@ -99,10 +99,12 @@ def load_data():
         terrain_food_modifiers = json.load(f)
     with open(DATA_DIR / "forts.json") as f:
         forts = json.load(f)
+    with open(DATA_DIR / "pop_demands.json") as f:
+        pop_demands = json.load(f)
     return (land_units, categories, age_progression, prices, combined_arms,
             goods_demands, production_recipes, localizations, naval_units,
             food_goods, food_buildings, building_caps, terrain_food_modifiers,
-            forts)
+            forts, pop_demands)
 
 
 LOC = {}  # populated in main(), used by loc() helper
@@ -4727,6 +4729,343 @@ def build_vassal_breakeven(wb):
     auto_width(ws, max_width=50)
 
 
+def build_annex_batching(wb):
+    """Optimal number of concurrent subject annexations by base speed.
+
+    Each concurrent annexation adds MULTIPLE_ANNEX_PENALTY (-0.5) to speed.
+    Throughput = N × (S − 0.5N).  Optimal N (continuous) = S.
+    """
+    ws = wb.create_sheet("Annexation Batching")
+
+    PENALTY = 0.5  # |MULTIPLE_ANNEX_PENALTY|
+
+    GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+    def eff_speed(s, n):
+        """Speed per annexation with n concurrent at base speed s."""
+        return max(0.0, s - PENALTY * n)
+
+    def tp(s, n):
+        """Total throughput with n concurrent at base speed s."""
+        return n * eff_speed(s, n)
+
+    def best_n(s):
+        """Integer N maximising throughput (lower N wins ties)."""
+        n_lo = max(1, int(s))
+        n_hi = n_lo + 1
+        return n_hi if tp(s, n_hi) > tp(s, n_lo) else n_lo
+
+    def best_ns(s):
+        """Set of equally-optimal integer N values."""
+        n_lo = max(1, int(s))
+        n_hi = n_lo + 1
+        t_lo, t_hi = tp(s, n_lo), tp(s, n_hi)
+        if t_hi > 0 and abs(t_hi - t_lo) < 0.001:
+            return {n_lo, n_hi}
+        return {n_hi} if t_hi > t_lo else {n_lo}
+
+    row = 1
+
+    # ===== Title =====
+    ws.cell(row=row, column=1,
+            value="Optimal Concurrent Annexation Count").font = TITLE_FONT
+    row += 2
+
+    # ===== Notes =====
+    notes = [
+        "Each concurrent annexation applies MULTIPLE_ANNEX_PENALTY = \u22120.5 "
+        "(\u221250%) to annexation speed.",
+        "Effective speed per annexation = Base Speed \u2212 50% \u00d7 N, where "
+        "N = number of concurrent annexations.",
+        "Throughput = N \u00d7 Effective Speed.  Optimal N \u2248 Base Speed "
+        "(as a multiplier, e.g. 5 at 500%).",
+        "At the optimal, each annexation runs at half the base speed "
+        "and total throughput = Base Speed\u00b2 \u00f7 2.",
+        "MAX_ANNEX_SIZE = 2 caps something else (not concurrent count).",
+    ]
+    for note in notes:
+        ws.cell(row=row, column=1, value=note).font = Font(italic=True, size=10)
+        row += 1
+    ws.cell(row=row, column=1,
+            value="Source: loading_screen/common/defines/00_defines.txt"
+            ).font = Font(italic=True, color="808080")
+    row += 2
+
+    # ===== Section 1: Quick Reference =====
+    ws.cell(row=row, column=1,
+            value="Optimal Count by Base Speed").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="When two N values give equal throughput, the lower is shown "
+            "(faster per-subject completion)."
+            ).font = Font(italic=True, size=10, color="808080")
+    row += 1
+
+    q_headers = ["Base Speed", "Optimal N", "Speed per\nAnnexation",
+                  "Total\nThroughput", "Speed-Up\nvs N=1"]
+    for i, h in enumerate(q_headers, 1):
+        c = ws.cell(row=row, column=i, value=h)
+        c.alignment = Alignment(wrap_text=True, horizontal="center",
+                                vertical="center")
+    style_header_row(ws, row, len(q_headers))
+    row += 1
+
+    speeds_qr = [s / 2 for s in range(2, 31)]  # 1.0 to 15.0, step 0.5
+
+    for S in speeds_qr:
+        n_opt = best_n(S)
+        spd = eff_speed(S, n_opt)
+        t_opt = tp(S, n_opt)
+        t_1 = tp(S, 1)
+        ratio = t_opt / t_1 if t_1 > 0 else 0
+
+        vals = [S, n_opt, spd, t_opt, ratio]
+        fmts = [NUM_FMT_PCT, "0", NUM_FMT_PCT, NUM_FMT_2, '0.00"x"']
+        for i, (v, fmt) in enumerate(zip(vals, fmts), 1):
+            cell = ws.cell(row=row, column=i, value=v)
+            cell.border = THIN_BORDER
+            cell.number_format = fmt
+            if i >= 2:
+                cell.alignment = Alignment(horizontal="center")
+        row += 1
+
+    # ===== Section 2: Throughput Matrix =====
+    row += 2
+    ws.cell(row=row, column=1,
+            value="Throughput Matrix").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Total annexation progress per month across all concurrent "
+            "annexations.  Green = optimal for that base speed."
+            ).font = Font(italic=True, size=10)
+    row += 1
+
+    max_n = 15
+    matrix_speeds = [float(s) for s in range(1, 16)]
+
+    # Label above header
+    ws.cell(row=row, column=2,
+            value="Concurrent Annexations \u2192").font = Font(
+                italic=True, size=10, color="808080")
+    row += 1
+
+    # Header row
+    ws.cell(row=row, column=1, value="Base Speed")
+    for n in range(1, max_n + 1):
+        ws.cell(row=row, column=n + 1, value=n)
+    style_header_row(ws, row, max_n + 1)
+    row += 1
+
+    for S in matrix_speeds:
+        cell = ws.cell(row=row, column=1, value=S)
+        cell.number_format = NUM_FMT_PCT
+        cell.border = THIN_BORDER
+
+        opt_set = best_ns(S)
+
+        for n in range(1, max_n + 1):
+            spd = eff_speed(S, n)
+            cell = ws.cell(row=row, column=n + 1)
+            cell.border = THIN_BORDER
+            if spd <= 0:
+                cell.value = "\u2014"
+                cell.alignment = Alignment(horizontal="center")
+                cell.font = Font(color="C0C0C0")
+            else:
+                cell.value = round(tp(S, n), 2)
+                cell.number_format = NUM_FMT_2
+                if n in opt_set:
+                    cell.fill = GREEN
+        row += 1
+
+    auto_width(ws)
+
+
+def build_pop_demands(wb, pop_demands):
+    """Pop demands per pop type, total demand value, and noble equivalency."""
+    ws = wb.create_sheet("Pop Demands")
+
+    POP_TYPES = ["nobles", "clergy", "burghers", "soldiers", "laborers",
+                 "peasants", "slaves", "tribesmen"]
+    POP_LABELS = {
+        "nobles": "Nobles", "clergy": "Clergy", "burghers": "Burghers",
+        "soldiers": "Soldiers", "laborers": "Laborers", "peasants": "Peasants",
+        "slaves": "Slaves", "tribesmen": "Tribesmen",
+    }
+
+    POP_FILLS = {
+        "nobles": PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
+        "clergy": PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"),
+        "burghers": PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid"),
+        "soldiers": PatternFill(start_color="F2DCDB", end_color="F2DCDB", fill_type="solid"),
+        "laborers": PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid"),
+        "peasants": PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),
+        "slaves": PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
+        "tribesmen": PatternFill(start_color="E4DFEC", end_color="E4DFEC", fill_type="solid"),
+    }
+
+    goods = pop_demands["goods"]
+    pop_info = pop_demands["pop_types"]
+
+    # Pre-compute demand value per good per pop type and sort goods by noble value desc
+    for g in goods:
+        g["values"] = {p: g["demands"][p] * g["price"] for p in POP_TYPES}
+    goods.sort(key=lambda g: g["values"]["nobles"], reverse=True)
+
+    # Compute totals
+    totals = {p: sum(g["values"][p] for g in goods) for p in POP_TYPES}
+
+    row = 1
+
+    # ===== Title =====
+    ws.cell(row=row, column=1,
+            value="Pop Type Goods Demands").font = TITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Baseline demand per pop (no culture/religion/location modifiers).  "
+            "Demand = demand_add \u00d7 demand_multiply from goods definitions."
+            ).font = Font(italic=True, size=10)
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Source: in_game/common/goods/*.txt, in_game/common/pop_types/00_default.txt"
+            ).font = Font(italic=True, color="808080", size=10)
+    row += 2
+
+    # ===== Section 1: Summary & Equivalency =====
+    ws.cell(row=row, column=1, value="Summary").font = SUBTITLE_FONT
+    row += 1
+
+    # Header
+    sum_headers = ["Pop Type", "Food Consumption", "Total Demand Value",
+                   "Noble Equivalency"]
+    for i, h in enumerate(sum_headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(sum_headers))
+    sum_header_row = row
+    row += 1
+
+    noble_total = totals["nobles"]
+    for p in POP_TYPES:
+        food = pop_info[p]["food_consumption"]
+        total = totals[p]
+        equiv = noble_total / total if total > 0 else 0
+
+        vals = [POP_LABELS[p], food, total, equiv]
+        fmts = [None, NUM_FMT_2, "0.0000", NUM_FMT_2]
+        for i, (v, fmt) in enumerate(zip(vals, fmts), 1):
+            cell = ws.cell(row=row, column=i, value=v)
+            cell.border = THIN_BORDER
+            cell.fill = POP_FILLS[p]
+            if fmt:
+                cell.number_format = fmt
+            if i >= 2:
+                cell.alignment = Alignment(horizontal="center")
+        row += 1
+
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Noble Equivalency: how many of each pop type equals 1 noble "
+            "in total goods demand value."
+            ).font = Font(italic=True, size=10, color="808080")
+    row += 2
+
+    # ===== Section 2: Demand Value Table =====
+    ws.cell(row=row, column=1, value="Demand Value by Good").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Value = Demand Quantity \u00d7 Market Price (gold per pop)"
+            ).font = Font(italic=True, size=10)
+    row += 1
+
+    # Header: Good | Price | Nobles | Clergy | ... | Tribesmen
+    val_headers = ["Good", "Price"] + [POP_LABELS[p] for p in POP_TYPES]
+    for i, h in enumerate(val_headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(val_headers))
+    val_header_row = row
+    row += 1
+
+    GOLD_FILL = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
+
+    # Track max value per column for highlighting
+    col_maxes = {p: 0 for p in POP_TYPES}
+    col_max_rows = {p: None for p in POP_TYPES}
+    data_start_row = row
+
+    for g in goods:
+        name = g["name"].replace("_", " ").replace("goods ", "").title()
+        ws.cell(row=row, column=1, value=name).border = THIN_BORDER
+        cell = ws.cell(row=row, column=2, value=g["price"])
+        cell.border = THIN_BORDER
+        cell.number_format = NUM_FMT_2
+
+        for j, p in enumerate(POP_TYPES):
+            val = g["values"][p]
+            cell = ws.cell(row=row, column=3 + j, value=val)
+            cell.border = THIN_BORDER
+            cell.number_format = "0.0000" if val < 0.01 else NUM_FMT_2
+            cell.alignment = Alignment(horizontal="center")
+            if val > col_maxes[p]:
+                col_maxes[p] = val
+                col_max_rows[p] = row
+        row += 1
+
+    # Total row
+    for i, h in enumerate(val_headers, 1):
+        ws.cell(row=row, column=i).border = THIN_BORDER
+    ws.cell(row=row, column=1, value="TOTAL").font = Font(bold=True)
+    ws.cell(row=row, column=1).border = THIN_BORDER
+    for j, p in enumerate(POP_TYPES):
+        cell = ws.cell(row=row, column=3 + j, value=totals[p])
+        cell.border = THIN_BORDER
+        cell.number_format = NUM_FMT_2
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    row += 1
+
+    # Highlight max value per pop type column
+    for j, p in enumerate(POP_TYPES):
+        r = col_max_rows[p]
+        if r:
+            ws.cell(row=r, column=3 + j).fill = GOLD_FILL
+
+    row += 2
+
+    # ===== Section 3: Demand Quantity Table =====
+    ws.cell(row=row, column=1, value="Demand Quantity by Good").font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Raw demand quantity per pop (before price weighting)"
+            ).font = Font(italic=True, size=10)
+    row += 1
+
+    qty_headers = ["Good", "Price"] + [POP_LABELS[p] for p in POP_TYPES]
+    for i, h in enumerate(qty_headers, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(qty_headers))
+    row += 1
+
+    for g in goods:
+        name = g["name"].replace("_", " ").replace("goods ", "").title()
+        ws.cell(row=row, column=1, value=name).border = THIN_BORDER
+        cell = ws.cell(row=row, column=2, value=g["price"])
+        cell.border = THIN_BORDER
+        cell.number_format = NUM_FMT_2
+
+        for j, p in enumerate(POP_TYPES):
+            val = g["demands"][p]
+            cell = ws.cell(row=row, column=3 + j, value=val)
+            cell.border = THIN_BORDER
+            cell.number_format = "0.0000" if val < 0.01 else NUM_FMT_2
+            cell.alignment = Alignment(horizontal="center")
+        row += 1
+
+    # Freeze at value table header
+    ws.freeze_panes = ws.cell(row=val_header_row + 1, column=1)
+
+    auto_width(ws)
+
+
 def main():
     if not DATA_DIR.exists():
         print("No data/ directory found. Run scraper.py first.")
@@ -4735,7 +5074,7 @@ def main():
     (land_units, categories, age_progression, prices, combined_arms,
      goods_demands, production_recipes, localizations, naval_units,
      food_goods, food_buildings, building_caps, terrain_food_modifiers,
-     forts) = load_data()
+     forts, pop_demands) = load_data()
 
     global LOC
     LOC = localizations
@@ -4856,6 +5195,12 @@ def main():
 
     print("Building Vassal Break-Even sheet...")
     build_vassal_breakeven(econ_wb)
+
+    print("Building Annexation Batching sheet...")
+    build_annex_batching(econ_wb)
+
+    print("Building Pop Demands sheet...")
+    build_pop_demands(econ_wb, pop_demands)
 
     # Remove placeholder
     econ_wb.remove(econ_ws)

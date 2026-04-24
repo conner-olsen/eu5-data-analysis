@@ -793,6 +793,98 @@ def scrape_forts() -> list:
     return forts
 
 
+def scrape_pop_demands() -> dict:
+    """Scrape per-pop-type goods demands from goods definitions and pop types.
+
+    Reads demand_add / demand_multiply from each good's definition and
+    pop_food_consumption from pop_types.  Returns resolved demand per pop per
+    good, plus prices and food consumption.
+
+    Returns: {
+        "pop_types": { "nobles": {"food_consumption": 20.0}, ... },
+        "goods": [
+            { "name": "wine", "price": 2, "demands": {"nobles": 0.006, ...} },
+            ...
+        ]
+    }
+    """
+    POP_TYPES = ["nobles", "clergy", "burghers", "soldiers", "laborers",
+                 "peasants", "slaves", "tribesmen"]
+    UPPER = {"nobles", "clergy", "burghers"}
+
+    def resolve_add(add_block: dict) -> dict[str, float]:
+        """Resolve demand_add to per-pop-type values (additive)."""
+        result = {p: 0.0 for p in POP_TYPES}
+        if not isinstance(add_block, dict):
+            return result
+        base_all = add_block.get("all", 0)
+        base_upper = add_block.get("upper", 0)
+        for p in POP_TYPES:
+            val = base_all
+            if p in UPPER:
+                val += base_upper
+            val += add_block.get(p, 0)
+            result[p] = val
+        return result
+
+    def resolve_multiply(mul_block: dict) -> dict[str, float]:
+        """Resolve demand_multiply to per-pop-type multipliers."""
+        result = {p: 1.0 for p in POP_TYPES}
+        if not isinstance(mul_block, dict):
+            return result
+        upper_mul = mul_block.get("upper", 1.0)
+        for p in POP_TYPES:
+            mul = 1.0
+            if p in UPPER:
+                mul *= upper_mul
+            if p in mul_block:
+                mul *= mul_block[p]
+            result[p] = mul
+        return result
+
+    # Scrape pop types for food consumption
+    pop_raw = parse_directory(COMMON_DIR / "pop_types")
+    pop_info = {}
+    for name in POP_TYPES:
+        data = pop_raw.get(name, {})
+        pop_info[name] = {
+            "food_consumption": data.get("pop_food_consumption", 0),
+        }
+
+    # Scrape goods definitions
+    goods_dir = COMMON_DIR / "goods"
+    goods_list = []
+    for filepath in sorted(goods_dir.glob("*.txt")):
+        raw = parse_file(filepath)
+        for name, data in raw.items():
+            if not isinstance(data, dict):
+                continue
+            demand_add = data.get("demand_add")
+            demand_multiply = data.get("demand_multiply")
+            if not demand_add and not demand_multiply:
+                continue  # no pop demand for this good
+
+            price = data.get("default_market_price", 1.0)
+            add_resolved = resolve_add(demand_add or {})
+            mul_resolved = resolve_multiply(demand_multiply or {})
+
+            demands = {}
+            for p in POP_TYPES:
+                demands[p] = add_resolved[p] * mul_resolved[p]
+
+            # Skip goods where all demands are zero
+            if all(v == 0 for v in demands.values()):
+                continue
+
+            goods_list.append({
+                "name": name,
+                "price": price,
+                "demands": demands,
+            })
+
+    return {"pop_types": pop_info, "goods": goods_list}
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -832,6 +924,9 @@ def main():
 
     print("Scraping forts...")
     forts = scrape_forts()
+
+    print("Scraping pop demands...")
+    pop_demands = scrape_pop_demands()
 
     print("Parsing unit type files...")
     raw_units = parse_directory(COMMON_DIR / "unit_types")
@@ -918,6 +1013,10 @@ def main():
     with open(OUTPUT_DIR / "forts.json", "w") as f:
         json.dump(forts, f, indent=2)
     print(f"  Wrote forts.json ({len(forts)} fort buildings)")
+
+    with open(OUTPUT_DIR / "pop_demands.json", "w") as f:
+        json.dump(pop_demands, f, indent=2)
+    print(f"  Wrote pop_demands.json ({len(pop_demands['goods'])} goods)")
 
     print("Done!")
 
