@@ -2404,12 +2404,13 @@ def build_navy(wb, naval_units, categories):
 
     ws.cell(row=1, column=1, value="Naval Units by Age").font = TITLE_FONT
     ws.cell(row=2, column=1,
-            value="NavalPower = Cannons x HullSize. "
+            value="NavalPower = Cannons x HullSize. Power/Width normalizes by frontage "
+                  "(galley=0.5, light/transport=1, heavy=1.5) so 3 galleys can engage per heavy slot. "
                   "Red = best overall in age, Blue = best in category.").font = Font(italic=True)
 
     headers = [
         "Age", "Category", "Unit",
-        "Naval Power", "Power/Crew",
+        "Naval Power", "Power/Crew", "Power/Width", "Width",
         "Cannons", "Hull Size", "Crew Size",
         "Movement", "Blockade", "Transport Cap",
         "Anti-Piracy", "Initiative", "Combat Speed",
@@ -2420,8 +2421,7 @@ def build_navy(wb, naval_units, categories):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    # Highlight: Naval Power=4, Power/Crew=5
-    HIGHLIGHT_COLS = [4, 5]
+    HIGHLIGHT_COLS = [4, 5, 6]
 
     units = _filter_naval(naval_units, generic_only=True)
 
@@ -2440,8 +2440,10 @@ def build_navy(wb, naval_units, categories):
             cannons = u.get("cannons", cat_data.get("cannons", 0)) or 0
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
             crew = u.get("crew_size", cat_data.get("crew_size", 0)) or 0
+            frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
             power_per_crew = naval_power / crew if crew > 0 else 0
+            power_per_width = naval_power / frontage if frontage > 0 else 0
 
             # Terrain from unit, then fall back to category
             terrain = u.get("terrain_combat", {})
@@ -2457,6 +2459,8 @@ def build_navy(wb, naval_units, categories):
                 loc(u["name"]),
                 naval_power,
                 round(power_per_crew, 1),
+                round(power_per_width, 1),
+                frontage,
                 cannons, hull, crew,
                 u.get("movement_speed", cat_data.get("movement_speed", 0)),
                 u.get("blockade_capacity", cat_data.get("blockade_capacity", 0)),
@@ -2648,11 +2652,13 @@ def build_navy_unique_terrain(wb, naval_units, categories):
     ws.cell(row=1, column=1, value="All Naval Units - Power by Water Type").font = TITLE_FONT
     ws.cell(row=2, column=1,
             value="Terrain Power = NavalPower * (1 + terrain_modifier). "
+                  "P/W = Terrain Power / frontage (galley=0.5, light/transport=1, heavy=1.5). "
                   "Includes all unique/special units.").font = Font(italic=True)
 
     headers = (
-        ["Age", "Category", "Unit", "Special", "Base Power"]
+        ["Age", "Category", "Unit", "Special", "Base Power", "Width"]
         + [f"Power ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
+        + [f"P/W ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
         + ["Cannons", "Hull Size"]
     )
     header_row = 4
@@ -2660,7 +2666,7 @@ def build_navy_unique_terrain(wb, naval_units, categories):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    HIGHLIGHT_COLS = [6, 7, 8, 9]
+    HIGHLIGHT_COLS = [7, 8, 9, 10, 11, 12, 13, 14]
 
     units = _filter_naval(naval_units, generic_only=False)
 
@@ -2678,6 +2684,7 @@ def build_navy_unique_terrain(wb, naval_units, categories):
 
             cannons = u.get("cannons", cat_data.get("cannons", 0)) or 0
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
+            frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
 
             terrain = u.get("terrain_combat", {})
@@ -2685,16 +2692,20 @@ def build_navy_unique_terrain(wb, naval_units, categories):
                 terrain = cat_data.get("combat", {})
 
             terrain_powers = []
+            terrain_pw = []
             for wt in WATER_TYPES:
                 mod = terrain.get(wt, 0)
-                terrain_powers.append(round(naval_power * (1 + mod), 1))
+                tp = naval_power * (1 + mod)
+                terrain_powers.append(round(tp, 1))
+                terrain_pw.append(round(tp / frontage if frontage > 0 else 0, 1))
 
             values = (
                 [AGE_LABELS.get(u.get("age", ""), "?"),
                  cat_label, loc(u["name"]),
                  "Yes" if u.get("is_special") else "",
-                 naval_power]
+                 naval_power, frontage]
                 + terrain_powers
+                + terrain_pw
                 + [cannons, hull]
             )
             for j, v in enumerate(values, 1):
@@ -2722,11 +2733,12 @@ def build_navy_unique(wb, naval_units, categories):
 
     ws.cell(row=1, column=1, value="All Naval Units by Age (incl. Unique)").font = TITLE_FONT
     ws.cell(row=2, column=1,
-            value="Red = best overall in age, Blue = best in category.").font = Font(italic=True)
+            value="Power/Width normalizes by frontage (galley=0.5, light/transport=1, heavy=1.5). "
+                  "Red = best overall in age, Blue = best in category.").font = Font(italic=True)
 
     headers = [
         "Age", "Category", "Unit", "Special",
-        "Naval Power", "Power/Crew",
+        "Naval Power", "Power/Crew", "Power/Width", "Width",
         "Cannons", "Hull Size", "Crew Size",
         "Movement", "Blockade", "Transport Cap",
         "Anti-Piracy", "Initiative", "Combat Speed",
@@ -2737,7 +2749,7 @@ def build_navy_unique(wb, naval_units, categories):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    HIGHLIGHT_COLS = [5, 6]
+    HIGHLIGHT_COLS = [5, 6, 7]
 
     units = _filter_naval(naval_units, generic_only=False)
 
@@ -2756,8 +2768,10 @@ def build_navy_unique(wb, naval_units, categories):
             cannons = u.get("cannons", cat_data.get("cannons", 0)) or 0
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
             crew = u.get("crew_size", cat_data.get("crew_size", 0)) or 0
+            frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
             power_per_crew = naval_power / crew if crew > 0 else 0
+            power_per_width = naval_power / frontage if frontage > 0 else 0
 
             terrain = u.get("terrain_combat", {})
             if not terrain:
@@ -2773,6 +2787,8 @@ def build_navy_unique(wb, naval_units, categories):
                 "Yes" if u.get("is_special") else "",
                 naval_power,
                 round(power_per_crew, 1),
+                round(power_per_width, 1),
+                frontage,
                 cannons, hull, crew,
                 u.get("movement_speed", cat_data.get("movement_speed", 0)),
                 u.get("blockade_capacity", cat_data.get("blockade_capacity", 0)),
@@ -2808,12 +2824,14 @@ def build_navy_gold(wb, naval_units, categories, prices):
 
     ws.cell(row=1, column=1, value="Naval Units - Power per Gold").font = TITLE_FONT
     ws.cell(row=2, column=1,
-            value="Power/Gold = NavalPower / BuildCost. "
+            value="Power/Gold = NavalPower / BuildCost x 100. "
+                  "Power/Width normalizes by frontage. P/W/Gold combines both: best gold efficiency per battle slot. "
                   "Red = best overall, Blue = best in category.").font = Font(italic=True)
 
     headers = [
         "Age", "Category", "Unit",
-        "Power/Gold", "Naval Power", "Build Cost",
+        "Power/Gold", "Power/Width", "P/W/Gold",
+        "Naval Power", "Width", "Build Cost",
         "Cannons", "Hull Size", "Crew Size",
         "Movement", "Blockade", "Transport Cap",
     ]
@@ -2822,7 +2840,7 @@ def build_navy_gold(wb, naval_units, categories, prices):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    HIGHLIGHT_COLS = [4]
+    HIGHLIGHT_COLS = [4, 5, 6]
 
     units = _filter_naval(naval_units, generic_only=True)
 
@@ -2841,17 +2859,22 @@ def build_navy_gold(wb, naval_units, categories, prices):
             cannons = u.get("cannons", cat_data.get("cannons", 0)) or 0
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
             crew = u.get("crew_size", cat_data.get("crew_size", 0)) or 0
+            frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
             # Naval max_strength is always 1.0, so cost = base * 10
             build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
             power_gold = naval_power / build_cost * 100 if build_cost > 0 else 0
+            power_per_width = naval_power / frontage if frontage > 0 else 0
+            pw_gold = power_per_width / build_cost * 100 if build_cost > 0 else 0
 
             values = [
                 AGE_LABELS.get(u.get("age", ""), "?"),
                 cat_label,
                 loc(u["name"]),
                 round(power_gold, 2),
-                naval_power, build_cost,
+                round(power_per_width, 1),
+                round(pw_gold, 2),
+                naval_power, frontage, build_cost,
                 cannons, hull, crew,
                 u.get("movement_speed", cat_data.get("movement_speed", 0)),
                 u.get("blockade_capacity", cat_data.get("blockade_capacity", 0)),
@@ -2882,12 +2905,14 @@ def build_navy_unique_terrain_gold(wb, naval_units, categories, prices):
 
     ws.cell(row=1, column=1, value="All Naval Units - Power per Gold by Water Type").font = TITLE_FONT
     ws.cell(row=2, column=1,
-            value="Terrain P/Gold = NavalPower * (1 + terrain_mod) / BuildCost * 100. "
+            value="P/Gold = NavalPower * (1 + terrain_mod) / BuildCost x 100. "
+                  "P/W/Gold also divides by frontage (galley=0.5, light/transport=1, heavy=1.5). "
                   "Includes all unique/special units.").font = Font(italic=True)
 
     headers = (
-        ["Age", "Category", "Unit", "Special", "Build Cost"]
+        ["Age", "Category", "Unit", "Special", "Width", "Build Cost"]
         + [f"P/Gold ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
+        + [f"P/W/Gold ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
         + ["Cannons", "Hull Size"]
     )
     header_row = 4
@@ -2895,7 +2920,7 @@ def build_navy_unique_terrain_gold(wb, naval_units, categories, prices):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    HIGHLIGHT_COLS = [6, 7, 8, 9]
+    HIGHLIGHT_COLS = [7, 8, 9, 10, 11, 12, 13, 14]
 
     units = _filter_naval(naval_units, generic_only=False)
 
@@ -2913,6 +2938,7 @@ def build_navy_unique_terrain_gold(wb, naval_units, categories, prices):
 
             cannons = u.get("cannons", cat_data.get("cannons", 0)) or 0
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
+            frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
             build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
 
@@ -2921,17 +2947,21 @@ def build_navy_unique_terrain_gold(wb, naval_units, categories, prices):
                 terrain = cat_data.get("combat", {})
 
             terrain_pg = []
+            terrain_pwg = []
             for wt in WATER_TYPES:
                 mod = terrain.get(wt, 0)
                 tp = naval_power * (1 + mod) / build_cost * 100 if build_cost > 0 else 0
                 terrain_pg.append(round(tp, 2))
+                pwg = tp / frontage if frontage > 0 else 0
+                terrain_pwg.append(round(pwg, 2))
 
             values = (
                 [AGE_LABELS.get(u.get("age", ""), "?"),
                  cat_label, loc(u["name"]),
                  "Yes" if u.get("is_special") else "",
-                 build_cost]
+                 frontage, build_cost]
                 + terrain_pg
+                + terrain_pwg
                 + [cannons, hull]
             )
             for j, v in enumerate(values, 1):
@@ -2960,11 +2990,14 @@ def build_navy_terrain(wb, naval_units, categories):
     ws.cell(row=1, column=1, value="Naval Units - Power by Water Type").font = TITLE_FONT
     ws.cell(row=2, column=1,
             value="Terrain Power = NavalPower * (1 + terrain_modifier). "
+                  "P/W = Terrain Power / frontage (galley=0.5, light/transport=1, heavy=1.5) "
+                  "so 3 galleys engage per heavy slot. "
                   "Galleys get bonuses in shallow water, penalties in deep ocean.").font = Font(italic=True)
 
     headers = (
-        ["Age", "Category", "Unit", "Base Power"]
+        ["Age", "Category", "Unit", "Base Power", "Width"]
         + [f"Power ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
+        + [f"P/W ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
         + ["Cannons", "Hull Size"]
     )
     header_row = 4
@@ -2972,8 +3005,8 @@ def build_navy_terrain(wb, naval_units, categories):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    # Highlight per-terrain power columns: 5, 6, 7, 8
-    HIGHLIGHT_COLS = [5, 6, 7, 8]
+    # Highlight per-terrain power cols (6-9) and per-terrain P/W cols (10-13)
+    HIGHLIGHT_COLS = [6, 7, 8, 9, 10, 11, 12, 13]
 
     units = _filter_naval(naval_units, generic_only=True)
 
@@ -2991,6 +3024,7 @@ def build_navy_terrain(wb, naval_units, categories):
 
             cannons = u.get("cannons", cat_data.get("cannons", 0)) or 0
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
+            frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
 
             # Get terrain modifiers (unit level, then category fallback)
@@ -2999,14 +3033,18 @@ def build_navy_terrain(wb, naval_units, categories):
                 terrain = cat_data.get("combat", {})
 
             terrain_powers = []
+            terrain_pw = []
             for wt in WATER_TYPES:
                 mod = terrain.get(wt, 0)
-                terrain_powers.append(round(naval_power * (1 + mod), 1))
+                tp = naval_power * (1 + mod)
+                terrain_powers.append(round(tp, 1))
+                terrain_pw.append(round(tp / frontage if frontage > 0 else 0, 1))
 
             values = (
                 [AGE_LABELS.get(u.get("age", ""), "?"),
-                 cat_label, loc(u["name"]), naval_power]
+                 cat_label, loc(u["name"]), naval_power, frontage]
                 + terrain_powers
+                + terrain_pw
                 + [cannons, hull]
             )
             for j, v in enumerate(values, 1):
@@ -3034,11 +3072,14 @@ def build_navy_terrain_gold(wb, naval_units, categories, prices):
 
     ws.cell(row=1, column=1, value="Naval Units - Power per Gold by Water Type").font = TITLE_FONT
     ws.cell(row=2, column=1,
-            value="Terrain P/Gold = NavalPower * (1 + terrain_mod) / BuildCost * 100.").font = Font(italic=True)
+            value="P/Gold = NavalPower * (1 + terrain_mod) / BuildCost x 100. "
+                  "P/W/Gold also divides by frontage (galley=0.5, light/transport=1, heavy=1.5) "
+                  "for gold efficiency per battle slot.").font = Font(italic=True)
 
     headers = (
-        ["Age", "Category", "Unit", "Build Cost"]
+        ["Age", "Category", "Unit", "Width", "Build Cost"]
         + [f"P/Gold ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
+        + [f"P/W/Gold ({t.replace('_', ' ').title()})" for t in WATER_TYPES]
         + ["Cannons", "Hull Size"]
     )
     header_row = 4
@@ -3046,7 +3087,7 @@ def build_navy_terrain_gold(wb, naval_units, categories, prices):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
 
-    HIGHLIGHT_COLS = [5, 6, 7, 8]
+    HIGHLIGHT_COLS = [6, 7, 8, 9, 10, 11, 12, 13]
 
     units = _filter_naval(naval_units, generic_only=True)
 
@@ -3064,6 +3105,7 @@ def build_navy_terrain_gold(wb, naval_units, categories, prices):
 
             cannons = u.get("cannons", cat_data.get("cannons", 0)) or 0
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
+            frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
             build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
 
@@ -3072,15 +3114,19 @@ def build_navy_terrain_gold(wb, naval_units, categories, prices):
                 terrain = cat_data.get("combat", {})
 
             terrain_pg = []
+            terrain_pwg = []
             for wt in WATER_TYPES:
                 mod = terrain.get(wt, 0)
                 tp = naval_power * (1 + mod) / build_cost * 100 if build_cost > 0 else 0
                 terrain_pg.append(round(tp, 2))
+                pwg = tp / frontage if frontage > 0 else 0
+                terrain_pwg.append(round(pwg, 2))
 
             values = (
                 [AGE_LABELS.get(u.get("age", ""), "?"),
-                 cat_label, loc(u["name"]), build_cost]
+                 cat_label, loc(u["name"]), frontage, build_cost]
                 + terrain_pg
+                + terrain_pwg
                 + [cannons, hull]
             )
             for j, v in enumerate(values, 1):
