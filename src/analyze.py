@@ -771,6 +771,7 @@ def build_light_vs_heavy(wb, land_units, categories):
         and not u.get("levy", False)
         and not u["name"].startswith("a_age_")
         and not u.get("is_special", False)
+        and not u.get("nation_specific", False)
     ]
 
     arm_pairs = [
@@ -1082,7 +1083,9 @@ def get_best_generic_units(land_units, categories):
                 and u.get("buildable", True)
                 and not u.get("levy", False)
                 and not u["name"].startswith("a_age_")
-                and not u.get("is_special", False)            ]
+                and not u.get("is_special", False)
+                and not u.get("nation_specific", False)
+            ]
 
             if not candidates:
                 age_types.append({
@@ -1247,6 +1250,27 @@ def optimize_composition(flank_powers, center_powers, combined_arms):
     return best_pcts, best_total, best_bonus, best_n_qual
 
 
+def combined_arms_for_age(combined_arms, age):
+    """combined_arms with bonus_per_type raised by combined-arms advances unlocked through `age`."""
+    bonus = combined_arms["bonus_per_type"]
+    deltas = combined_arms.get("bonus_advances_by_age", {})
+    for a in AGE_ORDER:
+        bonus += deltas.get(a, 0.0)
+        if a == age:
+            break
+    return {**combined_arms, "bonus_per_type": bonus}
+
+
+def combined_arms_subtitle(combined_arms):
+    """Subtitle line for the combined-arms values, noting per-age growth from advances."""
+    base = combined_arms["bonus_per_type"]
+    final = base + sum(combined_arms.get("bonus_advances_by_age", {}).values())
+    bonus_txt = f"{base:.1%}" if final <= base else f"{base:.1%} rising to {final:.1%} by age (combined-arms advances)"
+    return (f"Scraped: bonus/type={bonus_txt}, "
+            f"min threshold={combined_arms['min_percent']:.0%}, "
+            f"max cap={combined_arms['max_threshold']:.0%}")
+
+
 def build_optimal_composition(wb, land_units, categories, combined_arms):
     """Sheet: Optimal army composition per age using combined arms."""
     ws = wb.create_sheet("Optimal Comp (K-D)")
@@ -1256,9 +1280,7 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
     # Show scraped combined arms values
     ca = combined_arms
     ws.cell(row=2, column=1,
-            value=f"Scraped: bonus/type={ca['bonus_per_type']:.1%}, "
-                  f"min threshold={ca['min_percent']:.0%}, "
-                  f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
+            value=combined_arms_subtitle(ca)).font = SUBTITLE_FONT
     ws.cell(row=3, column=1,
             value="Positional placement: 33% center / 67% flanks. "
                   "Units assigned to center/flank to maximize power.").font = Font(italic=True)
@@ -1293,7 +1315,7 @@ def build_optimal_composition(wb, land_units, categories, combined_arms):
         center_powers = [t["center_power"] for t in types]
 
         pcts, total, bonus, nq = optimize_composition(
-            flank_powers, center_powers, combined_arms
+            flank_powers, center_powers, combined_arms_for_age(combined_arms, age)
         )
 
         # Compute per-type positional contribution
@@ -1382,7 +1404,9 @@ def get_best_generic_units_morale(land_units, categories):
                 and u.get("buildable", True)
                 and not u.get("levy", False)
                 and not u["name"].startswith("a_age_")
-                and not u.get("is_special", False)            ]
+                and not u.get("is_special", False)
+                and not u.get("nation_specific", False)
+            ]
 
             if not candidates:
                 age_types.append({
@@ -1430,9 +1454,7 @@ def build_optimal_composition_morale(wb, land_units, categories, combined_arms):
 
     ca = combined_arms
     ws.cell(row=2, column=1,
-            value=f"Scraped: bonus/type={ca['bonus_per_type']:.1%}, "
-                  f"min threshold={ca['min_percent']:.0%}, "
-                  f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
+            value=combined_arms_subtitle(ca)).font = SUBTITLE_FONT
     ws.cell(row=3, column=1,
             value="Same formula as strength but using morale_damage_done/taken. "
                   "Morale is flat per unit (not scaled by strength).").font = Font(italic=True)
@@ -1461,7 +1483,7 @@ def build_optimal_composition_morale(wb, land_units, categories, combined_arms):
         center_powers = [t["center_power"] for t in types]
 
         pcts, total, bonus, nq = optimize_composition(
-            flank_powers, center_powers, combined_arms
+            flank_powers, center_powers, combined_arms_for_age(combined_arms, age)
         )
 
         center_remaining = CENTER_RATIO
@@ -1536,7 +1558,9 @@ def get_cheapest_units(land_units, categories):
             and u.get("buildable", True)
             and not u.get("levy", False)
             and not u["name"].startswith("a_age_")
-            and not u.get("is_special", False)        ]
+            and not u.get("is_special", False)
+            and not u.get("nation_specific", False)
+        ]
         if not candidates:
             result[type_label] = None
             continue
@@ -1716,9 +1740,7 @@ def build_optimal_composition_budget(wb, land_units, categories, combined_arms, 
 
     ca = combined_arms
     ws.cell(row=2, column=1,
-            value=f"Scraped: bonus/type={ca['bonus_per_type']:.1%}, "
-                  f"min threshold={ca['min_percent']:.0%}, "
-                  f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
+            value=combined_arms_subtitle(ca)).font = SUBTITLE_FONT
     ws.cell(row=3, column=1,
             value="Uses cheapest unit from ANY age as filler to hit combined arms thresholds. "
                   "Maximizes power per gold for equal-budget armies.").font = Font(italic=True)
@@ -1743,7 +1765,7 @@ def build_optimal_composition_budget(wb, land_units, categories, combined_arms, 
         style_header_row(ws, row, len(headers))
         row += 1
 
-        result = optimize_budget(types, cheapest, prices, combined_arms)
+        result = optimize_budget(types, cheapest, prices, combined_arms_for_age(combined_arms, age))
         if not result:
             ws.cell(row=row, column=1, value="No valid composition found")
             row += 2
@@ -1826,9 +1848,7 @@ def build_optimal_composition_gold(wb, land_units, categories, combined_arms, pr
 
     ca = combined_arms
     ws.cell(row=2, column=1,
-            value=f"Scraped: bonus/type={ca['bonus_per_type']:.1%}, "
-                  f"min threshold={ca['min_percent']:.0%}, "
-                  f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
+            value=combined_arms_subtitle(ca)).font = SUBTITLE_FONT
     ws.cell(row=3, column=1,
             value="Positional placement: 33% center / 67% flanks. "
                   "Optimizes power/gold instead of raw power.").font = Font(italic=True)
@@ -1874,7 +1894,7 @@ def build_optimal_composition_gold(wb, land_units, categories, combined_arms, pr
 
         # Optimize using power/cost to find best composition
         pcts, _, bonus, nq = optimize_composition(
-            flank_pg, center_pg, combined_arms
+            flank_pg, center_pg, combined_arms_for_age(combined_arms, age)
         )
 
         # Compute true ratio: total_power / total_cost
@@ -1960,9 +1980,7 @@ def build_optimal_composition_iron(wb, land_units, categories, combined_arms,
 
     ca = combined_arms
     ws.cell(row=2, column=1,
-            value=f"Scraped: bonus/type={ca['bonus_per_type']:.1%}, "
-                  f"min threshold={ca['min_percent']:.0%}, "
-                  f"max cap={ca['max_threshold']:.0%}").font = SUBTITLE_FONT
+            value=combined_arms_subtitle(ca)).font = SUBTITLE_FONT
     ws.cell(row=3, column=1,
             value="Positional placement: 33% center / 67% flanks. "
                   "Optimizes power/iron (resolved via workshop recipes).").font = Font(italic=True)
@@ -2012,7 +2030,7 @@ def build_optimal_composition_iron(wb, land_units, categories, combined_arms,
 
         # Optimize using power/iron to find best composition
         pcts, _, bonus, nq = optimize_composition(
-            flank_pi, center_pi, combined_arms
+            flank_pi, center_pi, combined_arms_for_age(combined_arms, age)
         )
 
         # Compute true ratio: total_power / total_iron

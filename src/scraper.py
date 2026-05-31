@@ -159,6 +159,34 @@ def resolve_inheritance(all_units: dict) -> dict:
     return resolved
 
 
+# country_potential triggers that gate by government/age/DLC, not by nation identity.
+# Anything else (has_or_had_tag, culture, religion, has_variable, modifier:*, ...) ties the
+# unit to a specific nation or unlock, so it is not a generic unit everyone can build.
+_GENERIC_POTENTIAL_KEYS = {
+    "government_type", "country_type", "exists", "always",
+    "age", "current_age", "current_age_or_later", "is_age",
+    "has_dlc",
+}
+_LOGICAL_POTENTIAL_KEYS = {"and", "or", "not", "nor", "nand"}
+
+
+def is_nation_specific(potential) -> bool:
+    """True if a country_potential block ties the unit to specific nations/cultures/unlocks."""
+    if not isinstance(potential, dict):
+        return False
+    for key, val in potential.items():
+        if key.startswith("__"):
+            continue
+        k = key.lower()
+        if k in _LOGICAL_POTENTIAL_KEYS:
+            subs = val if isinstance(val, list) else [val]
+            if any(is_nation_specific(s) for s in subs):
+                return True
+        elif k not in _GENERIC_POTENTIAL_KEYS:
+            return True
+    return False
+
+
 def extract_unit_stats(name: str, data: dict, categories: dict) -> dict:
     """Extract relevant stats from a resolved unit definition."""
     unit = {"name": name}
@@ -192,6 +220,7 @@ def extract_unit_stats(name: str, data: dict, categories: dict) -> dict:
     unit["buildable"] = data.get("buildable", True)
     unit["levy"] = data.get("levy", False)
     unit["default"] = data.get("default", False)
+    unit["nation_specific"] = is_nation_specific(data.get("country_potential", {}))
 
     # Age
     unit["age"] = data.get("age", "")
@@ -451,13 +480,26 @@ def scrape_maritime_presence_values() -> dict:
 
 
 def scrape_combined_arms() -> dict:
-    """Scrape combined arms defines from auto_modifiers/country.txt."""
+    """Scrape combined arms defines from auto_modifiers/country.txt plus per-age advance bonuses."""
     raw = parse_directory(COMMON_DIR / "auto_modifiers")
     base = raw.get("country_base_values", {})
+
+    # Advances that raise combined_bonus_per_type, keyed by the age they unlock in
+    advances = parse_directory(COMMON_DIR / "advances")
+    bonus_advances_by_age = {}
+    for data in advances.values():
+        if not isinstance(data, dict):
+            continue
+        delta = data.get("combined_bonus_per_type")
+        age = data.get("age")
+        if isinstance(delta, (int, float)) and isinstance(age, str):
+            bonus_advances_by_age[age] = bonus_advances_by_age.get(age, 0) + delta
+
     return {
         "bonus_per_type": base.get("combined_bonus_per_type", 0),
         "min_percent": base.get("combined_arms_min_percent_for_bonus", 0),
         "max_threshold": base.get("combined_arms_max_threshold", 0),
+        "bonus_advances_by_age": bonus_advances_by_age,
     }
 
 
