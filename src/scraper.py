@@ -187,7 +187,7 @@ def extract_unit_stats(name: str, data: dict, categories: dict) -> dict:
                 unit[stat] = modifier[stat]
 
     # Boolean properties
-    unit["light"] = data.get("light", False)
+    unit["light"] = "light" in cat_name
     unit["is_special"] = data.get("is_special", False)
     unit["buildable"] = data.get("buildable", True)
     unit["levy"] = data.get("levy", False)
@@ -256,7 +256,9 @@ def build_age_progression(units: list[dict]) -> list[dict]:
         "age_5_absolutism",
         "age_6_revolutions",
     ]
-    land_categories = ["army_infantry", "army_cavalry", "army_artillery", "army_auxiliary"]
+    land_categories = ["army_heavy_infantry", "army_light_infantry",
+                       "army_heavy_cavalry", "army_light_cavalry",
+                       "army_artillery", "army_auxiliary"]
 
     rows = []
     for cat in land_categories:
@@ -290,13 +292,15 @@ def scrape_unit_prices() -> dict:
     """Scrape unit build/reinforce/maintenance gold costs from prices/02_units.txt.
 
     Returns dict keyed by category name, e.g.:
-    { "army_infantry": { "build_gold": 50, "reinforce_gold": 2.5, "maintenance_gold": 0.5 }, ... }
+    { "army_heavy_infantry": { "build_gold": 50, "reinforce_gold": 2.5, "maintenance_gold": 0.5 }, ... }
     """
     prices_dir = COMMON_DIR / "prices"
     raw = parse_directory(prices_dir)
 
     prices = {}
-    for cat in ["army_infantry", "army_cavalry", "army_artillery", "army_auxiliary",
+    for cat in ["army_heavy_infantry", "army_light_infantry",
+                 "army_heavy_cavalry", "army_light_cavalry",
+                 "army_artillery", "army_auxiliary",
                  "navy_heavy_ship", "navy_light_ship", "navy_galley", "navy_transport"]:
         entry = {}
         for cost_type in ["build", "reinforce", "maintenance"]:
@@ -400,9 +404,9 @@ def scrape_unit_localizations() -> dict:
     import re
     loc_dir = GAME_DIR / "main_menu" / "localization" / "english"
 
-    # First pass: build a global lookup of ALL localization keys
+    # First pass: build a global lookup of ALL localization keys (base + DLC subdirs)
     all_loc = {}
-    for loc_file in sorted(loc_dir.glob("*_l_english.yml")):
+    for loc_file in sorted(loc_dir.rglob("*_l_english.yml")):
         text = loc_file.read_text(encoding="utf-8-sig")
         for match in re.finditer(r'^\s+(\w+):\s*"([^"]*)"', text, re.MULTILINE):
             all_loc[match.group(1)] = match.group(2)
@@ -414,21 +418,18 @@ def scrape_unit_localizations() -> dict:
             return all_loc.get(ref_key, m.group(0))
         return re.sub(r'\$(\w+)\$', replacer, value)
 
-    # Extract unit names (a_ and n_ prefixes) from the units file
-    units_file = loc_dir / "units_l_english.yml"
-    if not units_file.exists():
-        return {}
-
-    text = units_file.read_text(encoding="utf-8-sig")
+    # Extract unit names (a_ and n_ prefixes) from every units file (base + DLC subdirs)
     names = {}
-    for match in re.finditer(r'^\s+([an]_\w+):\s*"([^"]*)"', text, re.MULTILINE):
-        key = match.group(1)
-        if key.endswith("_desc"):
-            continue
-        value = resolve(match.group(2))
-        # Strip [Script(...)] calls that can't be resolved statically
-        value = re.sub(r'\[.*?\]', '', value).strip()
-        names[key] = value
+    for units_file in sorted(loc_dir.rglob("*units_l_english.yml")):
+        text = units_file.read_text(encoding="utf-8-sig")
+        for match in re.finditer(r'^\s+([an]_\w+):\s*"([^"]*)"', text, re.MULTILINE):
+            key = match.group(1)
+            if key.endswith("_desc"):
+                continue
+            value = resolve(match.group(2))
+            # Strip [Script(...)] calls that can't be resolved statically
+            value = re.sub(r'\[.*?\]', '', value).strip()
+            names[key] = value
 
     return names
 
@@ -948,8 +949,8 @@ def main():
             unit["age"] = determine_age(unit)
         units.append(unit)
 
-    # Separate land vs naval
-    land_cats = {"army_infantry", "army_cavalry", "army_artillery", "army_auxiliary"}
+    # Separate land vs naval by the category's is_army flag
+    land_cats = {name for name, c in categories.items() if c.get("is_army")}
     land_units = [u for u in units if u["category"] in land_cats]
     naval_units = [u for u in units if u["category"] not in land_cats]
 

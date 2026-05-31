@@ -30,8 +30,10 @@ AGE_LABELS = {
     "age_6_revolutions": "6 - Revolutions",
 }
 CAT_LABELS = {
-    "army_infantry": "Infantry",
-    "army_cavalry": "Cavalry",
+    "army_heavy_infantry": "Heavy Infantry",
+    "army_light_infantry": "Light Infantry",
+    "army_heavy_cavalry": "Heavy Cavalry",
+    "army_light_cavalry": "Light Cavalry",
     "army_artillery": "Artillery",
     "army_auxiliary": "Auxiliary",
     "navy_galley": "Galley",
@@ -39,7 +41,9 @@ CAT_LABELS = {
     "navy_heavy_ship": "Heavy Ship",
     "navy_transport": "Transport",
 }
-LAND_CATS = ["army_infantry", "army_cavalry", "army_artillery", "army_auxiliary"]
+LAND_CATS = ["army_heavy_infantry", "army_light_infantry",
+             "army_heavy_cavalry", "army_light_cavalry",
+             "army_artillery", "army_auxiliary"]
 
 # Styling
 HEADER_FONT = Font(bold=True, size=11)
@@ -58,15 +62,24 @@ THIN_BORDER = Border(
 )
 
 # Category highlight colors
+FILL_BLUE = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+FILL_GREEN = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+FILL_ORANGE = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+FILL_GRAY = PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid")
+
 CAT_FILLS = {
-    "Infantry": PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid"),
-    "Cavalry": PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"),
-    "Artillery": PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
-    "Auxiliary": PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid"),
-    "Galley": PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid"),
-    "Light Ship": PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid"),
-    "Heavy Ship": PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
-    "Transport": PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid"),
+    "Infantry": FILL_BLUE,
+    "Heavy Infantry": FILL_BLUE,
+    "Light Infantry": FILL_BLUE,
+    "Cavalry": FILL_GREEN,
+    "Heavy Cavalry": FILL_GREEN,
+    "Light Cavalry": FILL_GREEN,
+    "Artillery": FILL_ORANGE,
+    "Auxiliary": FILL_GRAY,
+    "Galley": FILL_BLUE,
+    "Light Ship": FILL_GREEN,
+    "Heavy Ship": FILL_ORANGE,
+    "Transport": FILL_GRAY,
 }
 
 
@@ -343,8 +356,8 @@ def build_army_meta(wb, age_data, categories, prices):
     ws.freeze_panes = f"A{header_row + 1}"
 
 
-def build_buildable_units(wb, land_units, categories, prices):
-    """Sheet 2: All buildable units with detailed stats and power calculations."""
+def build_unique_units(wb, land_units, categories, prices):
+    """Unique Units sheet: every buildable land unit (generic and special), with stats and power calculations."""
     ws = wb.create_sheet("Unique Units")
 
     ws.cell(row=1, column=1, value="Unique Units by Age").font = TITLE_FONT
@@ -760,20 +773,23 @@ def build_light_vs_heavy(wb, land_units, categories):
         and not u.get("is_special", False)
     ]
 
+    arm_pairs = [
+        ("Infantry", "army_light_infantry", "army_heavy_infantry"),
+        ("Cavalry", "army_light_cavalry", "army_heavy_cavalry"),
+    ]
     row = header_row + 1
     for age in AGE_ORDER:
         age_units = [u for u in buildable if u.get("age") == age]
-        for cat in ["army_infantry", "army_cavalry"]:
-            cat_units = [u for u in age_units if u["category"] == cat]
-            lights = [u for u in cat_units if u.get("light")]
-            heavies = [u for u in cat_units if not u.get("light")]
+        for arm_label, light_cat, heavy_cat in arm_pairs:
+            lights = [u for u in age_units if u["category"] == light_cat]
+            heavies = [u for u in age_units if u["category"] == heavy_cat]
 
             if not lights or not heavies:
                 continue
 
             for u in heavies + lights:
-                cat_data = categories.get(cat, {})
-                cat_label = CAT_LABELS.get(cat, cat)
+                cat_data = categories.get(u["category"], {})
+                cat_label = arm_label
 
                 strength = u.get("max_strength", 0)
                 cp = u.get("combat_power", 0)
@@ -821,14 +837,14 @@ def build_light_vs_heavy(wb, land_units, categories):
 # Combined Arms Optimization
 # ---------------------------------------------------------------------------
 
-# The 6 combined-arms types (light/heavy count as separate)
+# The 6 land categories double as the combined-arms types (light/heavy count as separate)
 CA_TYPES = [
-    ("Heavy Infantry", "army_infantry", False),
-    ("Light Infantry", "army_infantry", True),
-    ("Heavy Cavalry", "army_cavalry", False),
-    ("Light Cavalry", "army_cavalry", True),
-    ("Artillery", "army_artillery", None),  # None = no light/heavy split
-    ("Auxiliary", "army_auxiliary", None),
+    ("Heavy Infantry", "army_heavy_infantry"),
+    ("Light Infantry", "army_light_infantry"),
+    ("Heavy Cavalry", "army_heavy_cavalry"),
+    ("Light Cavalry", "army_light_cavalry"),
+    ("Artillery", "army_artillery"),
+    ("Auxiliary", "army_auxiliary"),
 ]
 
 
@@ -880,12 +896,7 @@ def build_artillery_barrage(wb, land_units, forts, prices):
             barrage_rows.append((f"{AGE_LABELS[age]} - {loc(unit_name)}", b))
 
     # Alternating row fills by barrage group
-    fill_cycle = [
-        CAT_FILLS["Infantry"],   # light blue
-        CAT_FILLS["Cavalry"],    # light green
-        CAT_FILLS["Artillery"],  # light orange
-        CAT_FILLS["Auxiliary"],  # light gray
-    ]
+    fill_cycle = [FILL_BLUE, FILL_GREEN, FILL_ORANGE, FILL_GRAY]
 
     # Header row
     label_headers = ["Artillery", "Barrage", "Strength", "Fort", "Fort Level"]
@@ -1059,7 +1070,7 @@ def get_best_generic_units(land_units, categories):
     result = {}
     for age in AGE_ORDER:
         age_types = []
-        for type_label, cat, is_light in CA_TYPES:
+        for type_label, cat in CA_TYPES:
             cat_data = categories.get(cat, {})
             sfd = cat_data.get("secure_flanks_defense", 0)
             dmg_taken = cat_data.get("damage_taken", 1.0)
@@ -1071,9 +1082,7 @@ def get_best_generic_units(land_units, categories):
                 and u.get("buildable", True)
                 and not u.get("levy", False)
                 and not u["name"].startswith("a_age_")
-                and not u.get("is_special", False)
-                and (is_light is None or u.get("light", False) == is_light)
-            ]
+                and not u.get("is_special", False)            ]
 
             if not candidates:
                 age_types.append({
@@ -1361,7 +1370,7 @@ def get_best_generic_units_morale(land_units, categories):
     result = {}
     for age in AGE_ORDER:
         age_types = []
-        for type_label, cat, is_light in CA_TYPES:
+        for type_label, cat in CA_TYPES:
             cat_data = categories.get(cat, {})
             sfd = cat_data.get("secure_flanks_defense", 0)
             dmg_taken = cat_data.get("damage_taken", 1.0)
@@ -1373,9 +1382,7 @@ def get_best_generic_units_morale(land_units, categories):
                 and u.get("buildable", True)
                 and not u.get("levy", False)
                 and not u["name"].startswith("a_age_")
-                and not u.get("is_special", False)
-                and (is_light is None or u.get("light", False) == is_light)
-            ]
+                and not u.get("is_special", False)            ]
 
             if not candidates:
                 age_types.append({
@@ -1518,7 +1525,7 @@ def build_optimal_composition_morale(wb, land_units, categories, combined_arms):
 def get_cheapest_units(land_units, categories):
     """For each CA type, find the cheapest generic unit across ALL ages."""
     result = {}
-    for type_label, cat, is_light in CA_TYPES:
+    for type_label, cat in CA_TYPES:
         cat_data = categories.get(cat, {})
         sfd = cat_data.get("secure_flanks_defense", 0)
         dmg_taken = cat_data.get("damage_taken", 1.0)
@@ -1529,9 +1536,7 @@ def get_cheapest_units(land_units, categories):
             and u.get("buildable", True)
             and not u.get("levy", False)
             and not u["name"].startswith("a_age_")
-            and not u.get("is_special", False)
-            and (is_light is None or u.get("light", False) == is_light)
-        ]
+            and not u.get("is_special", False)        ]
         if not candidates:
             result[type_label] = None
             continue
@@ -1579,7 +1584,7 @@ def optimize_budget(best_units_age, cheapest_units, prices, combined_arms):
     cheap_cp = []
     cheap_costs = []
     for t in best_units_age:
-        cat_key = [c for label, c, _ in CA_TYPES if label == t["type_label"]][0]
+        cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
         best_costs.append(calc_maintenance(t["strength"], cat_key, prices))
         ch = cheapest_units.get(t["type_label"])
         if ch:
@@ -1756,7 +1761,7 @@ def build_optimal_composition_budget(wb, land_units, categories, combined_arms, 
             if use_cheap[i] and ch:
                 unit_name = ch["unit_name"]
                 unit_age = ch["age"]
-                cat_key = [c for label, c, _ in CA_TYPES if label == t["type_label"]][0]
+                cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
                 power = ch["center_power"]
                 cost = calc_maintenance(ch["strength"], cat_key, prices)
                 strength = ch["strength"]
@@ -1764,7 +1769,7 @@ def build_optimal_composition_budget(wb, land_units, categories, combined_arms, 
             else:
                 unit_name = t["unit_name"]
                 unit_age = age
-                cat_key = [c for label, c, _ in CA_TYPES if label == t["type_label"]][0]
+                cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
                 power = t["center_power"]
                 cost = calc_maintenance(t["strength"], cat_key, prices)
                 strength = t["strength"]
@@ -1857,7 +1862,7 @@ def build_optimal_composition_gold(wb, land_units, categories, combined_arms, pr
         flank_powers = [t["flank_power"] for t in types]
         center_powers = [t["center_power"] for t in types]
         for t in types:
-            cat_key = [c for label, c, _ in CA_TYPES if label == t["type_label"]][0]
+            cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
             cost = calc_cost(t["strength"], cat_key, prices)
             costs.append(cost)
             if cost > 0:
@@ -5130,8 +5135,8 @@ def main():
     print("Building Unit Power sheet...")
     build_army_meta(wb, age_progression, categories, prices)
 
-    print("Building Buildable Units sheet...")
-    build_buildable_units(wb, land_units, categories, prices)
+    print("Building Unique Units sheet...")
+    build_unique_units(wb, land_units, categories, prices)
 
     print("Building Levy Units sheet...")
     build_levy_units(wb, land_units, categories, prices)
