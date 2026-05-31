@@ -770,8 +770,7 @@ def build_light_vs_heavy(wb, land_units, categories):
         if u.get("buildable", True)
         and not u.get("levy", False)
         and not u["name"].startswith("a_age_")
-        and not u.get("is_special", False)
-        and not u.get("nation_specific", False)
+        and u.get("generic", False)
     ]
 
     arm_pairs = [
@@ -1083,8 +1082,7 @@ def get_best_generic_units(land_units, categories):
                 and u.get("buildable", True)
                 and not u.get("levy", False)
                 and not u["name"].startswith("a_age_")
-                and not u.get("is_special", False)
-                and not u.get("nation_specific", False)
+                and u.get("generic", False)
             ]
 
             if not candidates:
@@ -1404,8 +1402,7 @@ def get_best_generic_units_morale(land_units, categories):
                 and u.get("buildable", True)
                 and not u.get("levy", False)
                 and not u["name"].startswith("a_age_")
-                and not u.get("is_special", False)
-                and not u.get("nation_specific", False)
+                and u.get("generic", False)
             ]
 
             if not candidates:
@@ -1558,8 +1555,7 @@ def get_cheapest_units(land_units, categories):
             and u.get("buildable", True)
             and not u.get("levy", False)
             and not u["name"].startswith("a_age_")
-            and not u.get("is_special", False)
-            and not u.get("nation_specific", False)
+            and u.get("generic", False)
         ]
         if not candidates:
             result[type_label] = None

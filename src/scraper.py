@@ -11,6 +11,9 @@ COMMON_DIR = GAME_DIR / "in_game" / "common"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data"
 
 MARITIME_VALUES = {}  # populated in main() before unit extraction
+# Unit names from 2_unlocked_through_tech.txt (the generic tech-unlock progression every
+# country shares). Units defined in any other file are unique/nation/culture/DLC-specific.
+GENERIC_UNIT_NAMES = set()  # populated in main() before unit extraction
 
 # Stats we care about for army analysis
 NUMERIC_STATS = [
@@ -159,34 +162,6 @@ def resolve_inheritance(all_units: dict) -> dict:
     return resolved
 
 
-# country_potential triggers that gate by government/age/DLC, not by nation identity.
-# Anything else (has_or_had_tag, culture, religion, has_variable, modifier:*, ...) ties the
-# unit to a specific nation or unlock, so it is not a generic unit everyone can build.
-_GENERIC_POTENTIAL_KEYS = {
-    "government_type", "country_type", "exists", "always",
-    "age", "current_age", "current_age_or_later", "is_age",
-    "has_dlc",
-}
-_LOGICAL_POTENTIAL_KEYS = {"and", "or", "not", "nor", "nand"}
-
-
-def is_nation_specific(potential) -> bool:
-    """True if a country_potential block ties the unit to specific nations/cultures/unlocks."""
-    if not isinstance(potential, dict):
-        return False
-    for key, val in potential.items():
-        if key.startswith("__"):
-            continue
-        k = key.lower()
-        if k in _LOGICAL_POTENTIAL_KEYS:
-            subs = val if isinstance(val, list) else [val]
-            if any(is_nation_specific(s) for s in subs):
-                return True
-        elif k not in _GENERIC_POTENTIAL_KEYS:
-            return True
-    return False
-
-
 def extract_unit_stats(name: str, data: dict, categories: dict) -> dict:
     """Extract relevant stats from a resolved unit definition."""
     unit = {"name": name}
@@ -220,7 +195,7 @@ def extract_unit_stats(name: str, data: dict, categories: dict) -> dict:
     unit["buildable"] = data.get("buildable", True)
     unit["levy"] = data.get("levy", False)
     unit["default"] = data.get("default", False)
-    unit["nation_specific"] = is_nation_specific(data.get("country_potential", {}))
+    unit["generic"] = name in GENERIC_UNIT_NAMES
 
     # Age
     unit["age"] = data.get("age", "")
@@ -978,6 +953,12 @@ def main():
     raw_units = {k: v for k, v in raw_units.items() if isinstance(v, dict)}
 
     print(f"  Found {len(raw_units)} unit definitions")
+
+    global GENERIC_UNIT_NAMES
+    GENERIC_UNIT_NAMES = {
+        k for k, v in parse_file(COMMON_DIR / "unit_types" / "2_unlocked_through_tech.txt").items()
+        if isinstance(v, dict)
+    }
 
     print("Resolving inheritance chains...")
     resolved = resolve_inheritance(raw_units)
