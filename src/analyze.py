@@ -176,15 +176,17 @@ def calc_center_power(flank_power, sfd):
     return flank_power * (1 + 2 * sfd)
 
 
-def calc_cost(strength, category, prices):
-    """BuildCost = max_strength * base_build_gold * 10 (costs scale by max_strength)."""
+def calc_cost(strength, category, prices, unit_name=""):
+    """BuildCost = max_strength * (base_build_gold + unit_add) * 10."""
     base = prices.get(category, {}).get("build_gold", 100)
+    base += prices.get("unit_adds", {}).get(unit_name, {}).get("build_gold", 0)
     return strength * base * 10
 
 
-def calc_maintenance(strength, category, prices):
-    """Maintenance = max_strength * base_maintenance_gold * 10."""
+def calc_maintenance(strength, category, prices, unit_name=""):
+    """Maintenance = max_strength * (base_maintenance_gold + unit_add) * 10."""
     base = prices.get(category, {}).get("maintenance_gold", 1)
+    base += prices.get("unit_adds", {}).get(unit_name, {}).get("maintenance_gold", 0)
     return strength * base * 10
 
 
@@ -413,7 +415,7 @@ def build_unique_units(wb, land_units, categories, prices):
             sdt = safe_num(u.get("strength_damage_taken", 0))
 
             damage = strength * cp
-            build_cost = calc_cost(strength, cat, prices)
+            build_cost = calc_cost(strength, cat, prices, u["name"])
 
             fp = calc_flank_power(damage, sfd, dmg_taken, sdd, sdt)
             center = calc_center_power(fp, sfd)
@@ -509,7 +511,7 @@ def build_levy_units(wb, land_units, categories, prices):
             sdt = safe_num(u.get("strength_damage_taken", 0))
 
             damage = strength * cp
-            build_cost = calc_cost(strength, cat, prices)
+            build_cost = calc_cost(strength, cat, prices, u["name"])
 
             fp = calc_flank_power(damage, sfd, dmg_taken, sdd, sdt)
             center = calc_center_power(fp, sfd)
@@ -603,7 +605,7 @@ def build_upgrade_chains(wb, land_units, categories, prices):
                 damage = strength * current.get("combat_power", 0)
                 fp = calc_flank_power(damage, sfd, dmg_taken, sdd, sdt)
                 cp = round(calc_center_power(fp, sfd), 1)
-                maint = round(calc_maintenance(strength, cat, prices), 1)
+                maint = round(calc_maintenance(strength, cat, prices, current["name"]), 1)
                 cell = ws.cell(row=row, column=col, value=f"{loc(current['name'])} ({cp}p, {maint}g)")
                 cell.border = THIN_BORDER
                 cat_fill = CAT_FILLS.get(cat_label)
@@ -668,7 +670,7 @@ def build_levy_upgrade_chains(wb, land_units, categories, prices):
                 damage = strength * current.get("combat_power", 0)
                 fp = calc_flank_power(damage, sfd, dmg_taken, sdd, sdt)
                 cp = round(calc_center_power(fp, sfd), 1)
-                maint = round(calc_maintenance(strength, cat, prices), 1)
+                maint = round(calc_maintenance(strength, cat, prices, current["name"]), 1)
                 cell = ws.cell(row=row, column=col, value=f"{loc(current['name'])} ({cp}p, {maint}g)")
                 cell.border = THIN_BORDER
                 cat_fill = CAT_FILLS.get(cat_label)
@@ -975,7 +977,7 @@ def build_artillery_barrage(wb, land_units, forts, prices):
         b, unit_name = barrage_by_age[age]
         for u in land_units:
             if u["name"] == unit_name:
-                cost = calc_cost(safe_num(u.get("max_strength", 0)), "army_artillery", prices)
+                cost = calc_cost(safe_num(u.get("max_strength", 0)), "army_artillery", prices, u["name"])
                 age_num = AGE_LABELS[age].split(" - ")[0]
                 arty_units.append((f"{age_num} - {loc(unit_name)}", b, cost))
                 break
@@ -1605,12 +1607,12 @@ def optimize_budget(best_units_age, cheapest_units, prices, combined_arms):
     cheap_costs = []
     for t in best_units_age:
         cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
-        best_costs.append(calc_maintenance(t["strength"], cat_key, prices))
+        best_costs.append(calc_maintenance(t["strength"], cat_key, prices, t["unit_name"]))
         ch = cheapest_units.get(t["type_label"])
         if ch:
             cheap_fp.append(ch["flank_power"])
             cheap_cp.append(ch["center_power"])
-            cheap_costs.append(calc_maintenance(ch["strength"], cat_key, prices))
+            cheap_costs.append(calc_maintenance(ch["strength"], cat_key, prices, ch["unit_name"]))
         else:
             cheap_fp.append(0)
             cheap_cp.append(0)
@@ -1781,7 +1783,7 @@ def build_optimal_composition_budget(wb, land_units, categories, combined_arms, 
                 unit_age = ch["age"]
                 cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
                 power = ch["center_power"]
-                cost = calc_maintenance(ch["strength"], cat_key, prices)
+                cost = calc_maintenance(ch["strength"], cat_key, prices, ch["unit_name"])
                 strength = ch["strength"]
                 role = "Filler"
             else:
@@ -1789,7 +1791,7 @@ def build_optimal_composition_budget(wb, land_units, categories, combined_arms, 
                 unit_age = age
                 cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
                 power = t["center_power"]
-                cost = calc_maintenance(t["strength"], cat_key, prices)
+                cost = calc_maintenance(t["strength"], cat_key, prices, t["unit_name"])
                 strength = t["strength"]
                 role = "Power"
 
@@ -1879,7 +1881,7 @@ def build_optimal_composition_gold(wb, land_units, categories, combined_arms, pr
         center_powers = [t["center_power"] for t in types]
         for t in types:
             cat_key = [c for label, c in CA_TYPES if label == t["type_label"]][0]
-            cost = calc_cost(t["strength"], cat_key, prices)
+            cost = calc_cost(t["strength"], cat_key, prices, t["unit_name"])
             costs.append(cost)
             if cost > 0:
                 flank_pg.append(t["flank_power"] / cost * 100)
@@ -2266,7 +2268,7 @@ def pick_recipe(recipes, good, prefer_tier="workshop", prefer_variant="iron"):
     if not candidates:
         return None
 
-    tier_order = [prefer_tier, "guild", "manufactory", "factory", "unknown"]
+    tier_order = [prefer_tier, "guild", "manufactory", "mills", "unknown"]
 
     for tier in tier_order:
         tier_recipes = [r for r in candidates if r["tier"] == tier]
@@ -2567,7 +2569,7 @@ def build_maritime_per_sailor(wb, naval_units, categories, prices):
             mp = u.get("maritime_presence", 0) or 0
             crew = u.get("crew_size", cat_data.get("crew_size", 0)) or 0
             mp_per_sailor = mp / crew if crew > 0 else 0
-            cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
+            cost = calc_cost(u.get("max_strength", 1.0), cat, prices, u["name"])
 
             values = [
                 AGE_LABELS.get(age, "?"),
@@ -2626,8 +2628,8 @@ def build_maritime_per_gold(wb, naval_units, categories, prices):
         row += 1
 
         for u in sorted(units, key=lambda x: (
-            x.get("maritime_presence", 0) / calc_cost(x.get("max_strength", 1.0), x["category"], prices)
-            if calc_cost(x.get("max_strength", 1.0), x["category"], prices) > 0 else 0
+            x.get("maritime_presence", 0) / calc_cost(x.get("max_strength", 1.0), x["category"], prices, x["name"])
+            if calc_cost(x.get("max_strength", 1.0), x["category"], prices, x["name"]) > 0 else 0
         ), reverse=True):
             cat = u["category"]
             cat_data = categories.get(cat, {})
@@ -2635,7 +2637,7 @@ def build_maritime_per_gold(wb, naval_units, categories, prices):
 
             mp = u.get("maritime_presence", 0) or 0
             crew = u.get("crew_size", cat_data.get("crew_size", 0)) or 0
-            cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
+            cost = calc_cost(u.get("max_strength", 1.0), cat, prices, u["name"])
             mp_per_gold = mp / cost * 100 if cost > 0 else 0
 
             values = [
@@ -2881,7 +2883,7 @@ def build_navy_gold(wb, naval_units, categories, prices):
             frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
             # Naval max_strength is always 1.0, so cost = base * 10
-            build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
+            build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices, u["name"])
             power_gold = naval_power / build_cost * 100 if build_cost > 0 else 0
             power_per_width = naval_power / frontage if frontage > 0 else 0
             pw_gold = power_per_width / build_cost * 100 if build_cost > 0 else 0
@@ -2959,7 +2961,7 @@ def build_navy_unique_terrain_gold(wb, naval_units, categories, prices):
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
             frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
-            build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
+            build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices, u["name"])
 
             terrain = u.get("terrain_combat", {})
             if not terrain:
@@ -3126,7 +3128,7 @@ def build_navy_terrain_gold(wb, naval_units, categories, prices):
             hull = u.get("hull_size", cat_data.get("hull_size", 0)) or 0
             frontage = u.get("frontage", cat_data.get("frontage", 1.0)) or 1.0
             naval_power = cannons * hull
-            build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices)
+            build_cost = calc_cost(u.get("max_strength", 1.0), cat, prices, u["name"])
 
             terrain = u.get("terrain_combat", {})
             if not terrain:
@@ -3173,7 +3175,7 @@ def build_navy_terrain_gold(wb, naval_units, categories, prices):
 
 FOOD_BUILDING_ORDER = [
     "farming_village", "fishing_village", "forest_village", "fruit_orchard",
-    "sheep_farms", "windmill", "irrigation_systems", "pound_lock_canal_infrastructure",
+    "windmill", "irrigation_systems", "pound_lock_canal_infrastructure",
     "market_village", "elephant_hunting_grounds",
 ]
 
@@ -3182,7 +3184,6 @@ FOOD_BUILDING_LABELS = {
     "fishing_village": "Fishing Village",
     "forest_village": "Forest Village",
     "fruit_orchard": "Fruit Orchard",
-    "sheep_farms": "Sheep Farms",
     "windmill": "Windmill",
     "irrigation_systems": "Irrigation",
     "pound_lock_canal_infrastructure": "Canal",
@@ -4267,7 +4268,6 @@ def _run_full_simulation(allocator_fn, rgo_fv, sim_buildings, months=1200,
                 "farming_village": lvls.get("farming_village", 0),
                 "windmill": lvls.get("windmill", 0),
                 "irrigation": lvls.get("irrigation_systems", 0),
-                "sheep_farms": lvls.get("sheep_farms", 0),
                 "fruit_orchard": lvls.get("fruit_orchard", 0),
                 "food_prod": food_prod,
                 "food_cap": food_cap,
@@ -4367,7 +4367,7 @@ def _capped_farming_first_allocate(pop_budget, rgo_fv, buildings, rgo_max, caps)
     n_rgo = rgo_lvl
     remaining -= rgo_lvl
 
-    # 4. Fill any remaining into irrigation, sheep, etc.
+    # 4. Fill any remaining into other buildings
     for b in buildings:
         if remaining <= 0:
             break

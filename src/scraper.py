@@ -297,15 +297,20 @@ def scrape_unit_prices() -> dict:
 
     Returns dict keyed by category name, e.g.:
     { "army_heavy_infantry": { "build_gold": 50, "reinforce_gold": 2.5, "maintenance_gold": 0.5 }, ... }
+
+    Unit-specific entries in 02_units.txt are deltas added to the category base.
+    They are returned under "unit_adds", keyed by unit type name.
     """
     prices_dir = COMMON_DIR / "prices"
     raw = parse_directory(prices_dir)
 
+    categories = ["army_heavy_infantry", "army_light_infantry",
+                  "army_heavy_cavalry", "army_light_cavalry",
+                  "army_artillery", "army_auxiliary",
+                  "navy_heavy_ship", "navy_light_ship", "navy_galley", "navy_transport"]
+
     prices = {}
-    for cat in ["army_heavy_infantry", "army_light_infantry",
-                 "army_heavy_cavalry", "army_light_cavalry",
-                 "army_artillery", "army_auxiliary",
-                 "navy_heavy_ship", "navy_light_ship", "navy_galley", "navy_transport"]:
+    for cat in categories:
         entry = {}
         for cost_type in ["build", "reinforce", "maintenance"]:
             key = f"{cat}_{cost_type}"
@@ -314,6 +319,22 @@ def scrape_unit_prices() -> dict:
                 entry[f"{cost_type}_manpower"] = raw[key].get("manpower", raw[key].get("sailors", 0))
         if entry:
             prices[cat] = entry
+
+    units_raw = parse_file(prices_dir / "02_units.txt")
+    unit_adds = {}
+    for cost_type in ["build", "reinforce", "maintenance"]:
+        suffix = f"_{cost_type}"
+        for key, data in units_raw.items():
+            if not key.endswith(suffix) or not isinstance(data, dict):
+                continue
+            name = key[: -len(suffix)]
+            if name in categories:
+                continue
+            entry = unit_adds.setdefault(name, {})
+            entry[f"{cost_type}_gold"] = data.get("gold", 0)
+            entry[f"{cost_type}_manpower"] = data.get("manpower", data.get("sailors", 0))
+    if unit_adds:
+        prices["unit_adds"] = unit_adds
 
     return prices
 
@@ -350,7 +371,7 @@ def scrape_production_recipes() -> dict:
         "guild_input": "guild",
         "workshop_input": "workshop",
         "manufactory_input": "manufactory",
-        "factory_input": "factory",
+        "mills_input": "mills",
     }
     SKIP_KEYS = {"produced", "output", "category", "debug_max_profit"}
 
@@ -549,6 +570,9 @@ def scrape_food_buildings() -> dict:
     food_good_names = set(food_goods_data.keys())
     building_dir = COMMON_DIR / "building_types"
 
+    # Shared method definitions referenced via possible_production_methods
+    shared_methods = parse_directory(COMMON_DIR / "production_methods")
+
     # Only parse files that contain food-relevant buildings
     target_files = ["rural_buildings.txt", "common_buildings.txt"]
     result = {}
@@ -588,6 +612,8 @@ def scrape_food_buildings() -> dict:
             else:
                 upm_list = []
 
+            SKIP_KEYS = {"produced", "output", "category", "debug_max_profit"}
+
             for methods_block in upm_list:
                 if not isinstance(methods_block, dict):
                     continue
@@ -599,10 +625,25 @@ def scrape_food_buildings() -> dict:
                     if produced and produced in food_good_names and output_amt:
                         produces = {"good": produced, "output_per_level": output_amt}
                     # Collect inputs for this method
-                    skip = {"produced", "output", "category", "debug_max_profit"}
                     for k, v in method_data.items():
-                        if k not in skip and isinstance(v, (int, float)):
+                        if k not in SKIP_KEYS and isinstance(v, (int, float)):
                             inputs[k] = v
+
+            # Methods referenced by name; the first food-producing one wins
+            ppm = bld_data.get("possible_production_methods", {})
+            ppm_names = ppm.get("__bare_values__", []) if isinstance(ppm, dict) else []
+            for method_name in ppm_names:
+                method_data = shared_methods.get(method_name)
+                if not isinstance(method_data, dict):
+                    continue
+                produced = method_data.get("produced")
+                output_amt = method_data.get("output")
+                if produces or not produced or produced not in food_good_names or not output_amt:
+                    continue
+                produces = {"good": produced, "output_per_level": output_amt}
+                for k, v in method_data.items():
+                    if k not in SKIP_KEYS and isinstance(v, (int, float)):
+                        inputs[k] = v
 
             # Check modifiers
             modifier = bld_data.get("modifier", {})
@@ -1000,7 +1041,8 @@ def main():
 
     with open(OUTPUT_DIR / "unit_prices.json", "w") as f:
         json.dump(prices, f, indent=2)
-    print(f"  Wrote unit_prices.json ({len(prices)} categories)")
+    n_cats = len([k for k in prices if k != "unit_adds"])
+    print(f"  Wrote unit_prices.json ({n_cats} categories, {len(prices.get('unit_adds', {}))} unit adds)")
 
     with open(OUTPUT_DIR / "unit_categories.json", "w") as f:
         json.dump(categories, f, indent=2)
