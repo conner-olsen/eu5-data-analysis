@@ -82,6 +82,36 @@ CAT_FILLS = {
     "Transport": FILL_GRAY,
 }
 
+# Best Trade Nations columns: (json key, label, is_percent, weight).
+# weight = profit-% contributed per natural unit of the modifier (per 1% for percent
+# modifiers, per +1 for flat ones), from in-game trade-tooltip analysis. 0 = discounted.
+TRADE_MOD_COLUMNS = [
+    ("trade_income", "Trade Income", True, 1.0),
+    ("selling_efficiency", "Selling Eff.", True, 3.6),
+    ("export_efficiency", "Export Eff.", True, 2.2 * 0.75),   # x0.75: mostly-export trade share
+    ("import_efficiency", "Import Eff.", True, 2.2 * 0.25),   # x0.25: minority-import trade share
+    ("foreign_export_from_market_efficiency", "Foreign Export Eff.", True, 2.2 * 0.75),  # assumed like export
+    ("merchant_maintenance_efficiency", "Merchant Maint. Eff.", True, 0.30),
+    ("global_merchant_power", "Merchant Power", True, 0.0),
+    ("merchant_power_from_maritime_modifier", "Maritime Merch. Power", True, 0.0),
+    ("global_merchant_capacity_modifier", "Merchant Capacity", True, 1.0),
+    ("trade_range_modifier", "Trade Range", True, 0.53),
+    ("global_trade_center_power", "Trade Center Power", True, 0.0),
+    ("global_trade_protection_factor", "Trade Protection", True, 0.0),
+    ("trade_land_efficiency", "Land Trade Eff.", True, 0.23 * 0.6),   # x0.6: applies to part of each route
+    ("trade_sea_efficiency", "Sea Trade Eff.", True, 0.23 * 0.6),
+    ("global_trade_through_owned_territory_efficiency", "Owned-Terr. Trade Eff.", True, 0.23 * 0.15),  # x0.15: only the owned leg
+    ("global_trades_per_burgher", "Trades/Burgher", True, 0.0),
+    ("market_building_levels", "Market Bldg Levels", False, 0.0),
+    ("merchant_power_from_maritime", "Maritime Merch. Power (flat)", False, 0.0),
+    ("trade_range", "Trade Range (flat)", False, 0.12),
+]
+
+
+def _trade_points(value, is_percent, weight):
+    """Profit-equivalent points a modifier awards: its size (per 1% for percent, per +1 for flat) x weight."""
+    return (value * 100 if is_percent else value) * weight
+
 
 def load_data():
     with open(DATA_DIR / "land_units.json") as f:
@@ -114,10 +144,14 @@ def load_data():
         forts = json.load(f)
     with open(DATA_DIR / "pop_demands.json") as f:
         pop_demands = json.load(f)
+    with open(DATA_DIR / "trade_nations.json") as f:
+        trade_nations = json.load(f)
+    with open(DATA_DIR / "trade_gov_types.json") as f:
+        trade_gov_types = json.load(f)
     return (land_units, categories, age_progression, prices, combined_arms,
             goods_demands, production_recipes, localizations, naval_units,
             food_goods, food_buildings, building_caps, terrain_food_modifiers,
-            forts, pop_demands)
+            forts, pop_demands, trade_nations, trade_gov_types)
 
 
 LOC = {}  # populated in main(), used by loc() helper
@@ -5131,6 +5165,288 @@ def build_pop_demands(wb, pop_demands):
     auto_width(ws)
 
 
+def _score_mods(mods):
+    """Weighted profit-equivalent score of a modifier dict (per-point weights from TRADE_MOD_COLUMNS)."""
+    return sum(_trade_points(mods[k], is_pct, w)
+               for k, _, is_pct, w in TRADE_MOD_COLUMNS if mods.get(k) and w)
+
+
+# Reformed religions a Catholic nation can adopt: Lutheran/Calvinist/Waldensian anywhere, Anglican and
+# Lollardy only in England, Hussite only in Bohemia (availability is event/movement-driven, so curated).
+REFORMED_UNIVERSAL = {"lutheran", "calvinist", "waldensian"}
+REFORMED_BY_TAG = {"ENG": {"anglican", "lollardy"}, "BOH": {"hussite"}}
+
+
+def _effective_rows(trade_nations, trade_gov_types, gov):
+    """Row set for the trade sheets: real nations with their formables' modifiers folded in, plus any
+    formable with no in-list former kept standalone.
+
+    Returns [{tag, name, mods, gov, religion, sources}]. With gov=True, mods include the best-scoring
+    government-type bundle plus the nation's starting-religion bundle (best reformed option for Catholics).
+    """
+    formables = trade_gov_types.get("formables", {})
+    by_tag = trade_gov_types.get("by_tag", {})
+    bonuses = trade_gov_types.get("bonuses", {})
+    religion_bonuses = trade_gov_types.get("religion_bonuses", {})
+    by_religion = trade_gov_types.get("by_religion", {})
+
+    folded = set()       # formables with >=1 in-list former (credited to formers, not their own row)
+    reach = {}           # former tag -> [(formable mods, formable natural gov), ...]
+    for ftag, fi in formables.items():
+        formers = [t for t in fi.get("formers", []) if t in trade_nations]
+        if not formers:
+            continue
+        folded.add(ftag)
+        fmods = trade_nations.get(ftag, {}).get("mods", {})
+        for ft in formers:
+            reach.setdefault(ft, []).append((fmods, fi.get("gov")))
+
+    def with_bundle(mods, gt):
+        if not gt or gt not in bonuses:
+            return mods
+        out = dict(mods)
+        for k, v in bonuses[gt]["mods"].items():
+            out[k] = out.get(k, 0.0) + v
+        return out
+
+    rows = []
+    for tag, info in trade_nations.items():
+        if tag in folded:
+            continue
+        mods = dict(info.get("mods", {}))
+        reachable = reach.get(tag, [])
+        for fmods, _ in reachable:           # union: forming keeps all unique content
+            for k, v in fmods.items():
+                mods[k] = mods.get(k, 0.0) + v
+        gt, rel = None, None
+        if gov:
+            cand = set()
+            if by_tag.get(tag):
+                cand.add(by_tag[tag])
+            for _, fgov in reachable:
+                if fgov:
+                    cand.add(fgov)
+            if tag in formables and formables[tag].get("gov"):
+                cand.add(formables[tag]["gov"])      # standalone formable uses its natural type
+            best = None
+            for g in cand:
+                s = _score_mods(with_bundle(mods, g))
+                if best is None or s > best[0]:
+                    best = (s, g)
+            if best:
+                gt, mods = best[1], with_bundle(mods, best[1])
+            own_rel = by_religion.get(tag)
+            if own_rel:
+                rcand = {own_rel}
+                if own_rel == "catholic":
+                    rcand |= REFORMED_UNIVERSAL | REFORMED_BY_TAG.get(tag, set())
+                rel, best_s = own_rel, _score_mods(religion_bonuses.get(own_rel, {}).get("mods", {}))
+                for rc in rcand:
+                    s = _score_mods(religion_bonuses.get(rc, {}).get("mods", {}))
+                    if s > best_s:        # only switch faith if a reformed option scores strictly higher
+                        best_s, rel = s, rc
+                mods = dict(mods)
+                for k, v in religion_bonuses.get(rel, {}).get("mods", {}).items():
+                    mods[k] = mods.get(k, 0.0) + v
+        rows.append({"tag": tag, "name": info.get("name", tag), "mods": mods,
+                     "gov": gt, "religion": rel, "sources": len(info.get("entries", []))})
+    return rows
+
+
+def build_best_trade_nations(wb, trade_nations, trade_gov_types, gov=False):
+    """Nations ranked by weighted trade-modifier value from advances, government reforms, estate privileges, and laws.
+
+    Each formable's modifiers are folded into the nations that can form it. With gov=True, each nation's
+    score also folds in the best-scoring government-type bundle (its own type, or a formable's).
+    """
+    suffix = " (Gov Type)" if gov else ""
+    ws = wb.create_sheet("Best Trade Nations" + suffix)
+
+    rows = _effective_rows(trade_nations, trade_gov_types, gov)
+    for r in rows:
+        r["score"] = _score_mods(r["mods"])
+    rows.sort(key=lambda r: (r["score"], r["sources"]), reverse=True)
+
+    active_cols = [c for c in TRADE_MOD_COLUMNS if any(r["mods"].get(c[0]) for r in rows)]
+    lead = 5 if gov else 3
+
+    row = 1
+    ws.cell(row=row, column=1, value="Best Trade Nations" + suffix).font = TITLE_FONT
+    row += 1
+    sub = ("Ranked by weighted trade-modifier value (profit-equivalent) from each nation's "
+           "advances, government reforms, estate privileges, and country laws"
+           + (", plus the generic bonuses of its starting government type." if gov else "."))
+    ws.cell(row=row, column=1, value=sub).font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Weighted Score sums each modifier x its per-point weight (shown in the Weight row). "
+            "Weights come from in-game trade-tooltip analysis (selling outranks export/import outranks "
+            "merchant maintenance per point); trade-efficiency modifiers are scaled by the route fraction "
+            "they affect; trade income and merchant capacity count flat; dead modifiers are 0."
+            ).font = Font(italic=True, color="808080", size=10)
+    row += 1
+    note = ("Approximate: a modifier's real value scales inversely with a trade's profit margin, so "
+            "read the score as a relative ranking, not a literal profit gain.  Raw modifier values are shown "
+            "per column (grey = weight 0); reforms, privileges, and laws are mutually-exclusive choices.")
+    if gov:
+        note += "  Government-type bonuses are folded in by each nation's starting government."
+    ws.cell(row=row, column=1, value=note).font = Font(italic=True, color="808080", size=10)
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Source: in_game/common/advances, /government_reforms, /estate_privileges, /laws"
+            ).font = Font(italic=True, color="808080", size=10)
+    row += 2
+
+    headers = (["Rank", "Nation", "Tag"] + (["Gov Type", "Religion"] if gov else [])
+               + [c[1] for c in active_cols] + ["Weighted Score", "Sources"])
+    header_row = row
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(headers))
+    row += 1
+
+    # Per-point weight for each modifier column, kept beside the data it scales.
+    wt_font = Font(italic=True, size=9, color="808080")
+    c = ws.cell(row=row, column=2, value="Weight / point"); c.font = wt_font
+    c.alignment = Alignment(horizontal="right")
+    for i, (_, _, _, w) in enumerate(active_cols):
+        c = ws.cell(row=row, column=lead + 1 + i, value=w)
+        c.font = wt_font
+        c.alignment = Alignment(horizontal="center")
+        c.number_format = "0.##"
+    row += 1
+    data_start = row
+
+    center = Alignment(horizontal="center")
+    grey = Font(color="A6A6A6")
+    for rank, r in enumerate(rows, 1):
+        col = 1
+        c = ws.cell(row=row, column=col, value=rank); c.border = THIN_BORDER; c.alignment = center; col += 1
+        c = ws.cell(row=row, column=col, value=r["name"]); c.border = THIN_BORDER; col += 1
+        c = ws.cell(row=row, column=col, value=r["tag"]); c.border = THIN_BORDER; c.alignment = center; col += 1
+        if gov:
+            gt = r["gov"]
+            c = ws.cell(row=row, column=col, value=(gt.replace("_", " ").title() if gt else None))
+            c.border = THIN_BORDER; c.alignment = center; col += 1
+            rel = r.get("religion")
+            c = ws.cell(row=row, column=col, value=(rel.replace("_", " ").title() if rel else None))
+            c.border = THIN_BORDER; c.alignment = center; col += 1
+        for key, _, is_pct, w in active_cols:
+            val = r["mods"].get(key)
+            c = ws.cell(row=row, column=col, value=(val if val else None))
+            c.border = THIN_BORDER
+            c.alignment = center
+            if val:
+                c.number_format = "0.0%" if is_pct else NUM_FMT_2
+                if not w:
+                    c.font = grey
+            col += 1
+        c = ws.cell(row=row, column=col, value=round(r["score"], 1))
+        c.border = THIN_BORDER
+        c.number_format = "0.0"
+        c.font = Font(bold=True)
+        if rank <= 5:
+            c.fill = FILL_GREEN
+        col += 1
+        c = ws.cell(row=row, column=col, value=r["sources"]); c.border = THIN_BORDER; c.alignment = center
+        row += 1
+
+    ws.freeze_panes = f"{get_column_letter(lead + 1)}{data_start}"
+    auto_width(ws)
+
+
+def build_best_trade_nations_points(wb, trade_nations, trade_gov_types, gov=False):
+    """Weighted trade nations with dead modifiers removed; each cell pairs the modifier value with the points it awards.
+
+    Each formable's modifiers fold into its formers. With gov=True, mods/points also include the
+    best-scoring government-type bundle.
+    """
+    suffix = " (Gov Type)" if gov else ""
+    sheet_name = "Trade Nations Pts (Gov Type)" if gov else "Best Trade Nations (Points)"
+    ws = wb.create_sheet(sheet_name)
+
+    scored_cols = [c for c in TRADE_MOD_COLUMNS if c[3]]
+
+    rows = []
+    for r in _effective_rows(trade_nations, trade_gov_types, gov):
+        pts = {k: _trade_points(r["mods"][k], is_pct, w)
+               for k, _, is_pct, w in scored_cols if r["mods"].get(k)}
+        if not pts:
+            continue
+        r["pts"] = pts
+        r["score"] = sum(pts.values())
+        rows.append(r)
+    rows.sort(key=lambda r: (r["score"], r["sources"]), reverse=True)
+
+    active_cols = [c for c in scored_cols if any(r["pts"].get(c[0]) for r in rows)]
+    lead = 5 if gov else 3
+
+    row = 1
+    ws.cell(row=row, column=1, value="Best Trade Nations (Points)" + suffix).font = TITLE_FONT
+    row += 1
+    sub = ("Weighted trade value with zero-weight modifiers removed; each cell pairs the modifier "
+           "value with the points it awards.")
+    if gov:
+        sub += "  Includes each nation's starting government-type bonuses."
+    ws.cell(row=row, column=1, value=sub).font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Each modifier cell reads value (points), where points = value x the per-point weight "
+            "under the modifier name.  Percent modifiers score per 1%, flat ones per +1 point.  Weighted "
+            "Score is the row total; nations with only dead modifiers are omitted."
+            ).font = Font(italic=True, color="808080", size=10)
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Source: in_game/common/advances, /government_reforms, /estate_privileges, /laws"
+            ).font = Font(italic=True, color="808080", size=10)
+    row += 2
+
+    headers = (["Rank", "Nation", "Tag"] + (["Gov Type", "Religion"] if gov else [])
+               + [f"{label}\nx{w:g}" for _, label, _, w in active_cols]
+               + ["Weighted Score", "Sources"])
+    header_row = row
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=header_row, column=i, value=h)
+    style_header_row(ws, header_row, len(headers))
+    row += 1
+    data_start = row
+
+    center = Alignment(horizontal="center")
+    for rank, r in enumerate(rows, 1):
+        col = 1
+        c = ws.cell(row=row, column=col, value=rank); c.border = THIN_BORDER; c.alignment = center; col += 1
+        c = ws.cell(row=row, column=col, value=r["name"]); c.border = THIN_BORDER; col += 1
+        c = ws.cell(row=row, column=col, value=r["tag"]); c.border = THIN_BORDER; c.alignment = center; col += 1
+        if gov:
+            gt = r["gov"]
+            c = ws.cell(row=row, column=col, value=(gt.replace("_", " ").title() if gt else None))
+            c.border = THIN_BORDER; c.alignment = center; col += 1
+            rel = r.get("religion")
+            c = ws.cell(row=row, column=col, value=(rel.replace("_", " ").title() if rel else None))
+            c.border = THIN_BORDER; c.alignment = center; col += 1
+        for key, _, is_pct, w in active_cols:
+            val = r["mods"].get(key)
+            if val:
+                p = r["pts"].get(key, 0.0)
+                text = f"{val:.1%} ({p:.1f})" if is_pct else f"{val:g} ({p:.1f})"
+            else:
+                text = None
+            c = ws.cell(row=row, column=col, value=text)
+            c.border = THIN_BORDER
+            c.alignment = center
+            col += 1
+        c = ws.cell(row=row, column=col, value=round(r["score"], 1))
+        c.border = THIN_BORDER; c.number_format = "0.0"; c.font = Font(bold=True)
+        if rank <= 5:
+            c.fill = FILL_GREEN
+        col += 1
+        c = ws.cell(row=row, column=col, value=r["sources"]); c.border = THIN_BORDER; c.alignment = center
+        row += 1
+
+    ws.freeze_panes = f"{get_column_letter(lead + 1)}{data_start}"
+    auto_width(ws)
+
+
 def main():
     if not DATA_DIR.exists():
         print("No data/ directory found. Run scraper.py first.")
@@ -5139,7 +5455,7 @@ def main():
     (land_units, categories, age_progression, prices, combined_arms,
      goods_demands, production_recipes, localizations, naval_units,
      food_goods, food_buildings, building_caps, terrain_food_modifiers,
-     forts, pop_demands) = load_data()
+     forts, pop_demands, trade_nations, trade_gov_types) = load_data()
 
     global LOC
     LOC = localizations
@@ -5266,6 +5582,18 @@ def main():
 
     print("Building Pop Demands sheet...")
     build_pop_demands(econ_wb, pop_demands)
+
+    print("Building Best Trade Nations sheet...")
+    build_best_trade_nations(econ_wb, trade_nations, trade_gov_types)
+
+    print("Building Best Trade Nations (Points) sheet...")
+    build_best_trade_nations_points(econ_wb, trade_nations, trade_gov_types)
+
+    print("Building Best Trade Nations (Gov Type) sheet...")
+    build_best_trade_nations(econ_wb, trade_nations, trade_gov_types, gov=True)
+
+    print("Building Best Trade Nations (Points, Gov Type) sheet...")
+    build_best_trade_nations_points(econ_wb, trade_nations, trade_gov_types, gov=True)
 
     # Remove placeholder
     econ_wb.remove(econ_ws)
