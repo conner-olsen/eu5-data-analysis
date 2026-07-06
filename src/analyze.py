@@ -107,10 +107,38 @@ TRADE_MOD_COLUMNS = [
     ("trade_range", "Trade Range (flat)", False, 0.12),
 ]
 
+# trade_income raises your share of each trade's profit (as the crown estate your share is your crown
+# power), so it scores as 1 + value / crown_power, not as a flat 1 + value multiplier.  Sitting below a
+# 100% share makes each point worth more than face, and the merchant republic reform (+25%) the most.
+INCOME_BASELINE_SWAP = 0.50   # plain sheet: assume every nation adopts the merchant republic reform
+# Assumed crown power by government type: a 25% base, plus +10% monarchy / +5% theocracy for crown power
+# the game files do not expose.
+CROWN_POWER = {"republic": 0.25, "monarchy": 0.35, "theocracy": 0.30}
+CROWN_POWER_DEFAULT = 0.35
+# Steppe hordes and tribes are scored as monarchies (same crown power and government-type trade income).
+GOV_ALIAS = {"steppe_horde": "monarchy", "tribe": "monarchy"}
+# Export/import efficiency cut the price you pay rather than adding income, so they are reductive: at 90%
+# you pay 10%, at 95% you pay 5%.  A point is worth value / (1 - value), growing as you stack.
+REDUCTIVE_MODS = {"export_efficiency", "import_efficiency", "foreign_export_from_market_efficiency"}
+
+
+def _crown_power(gt):
+    """Crown-power baseline for a government type, mapping steppe hordes and tribes to monarchy."""
+    return CROWN_POWER.get(GOV_ALIAS.get(gt, gt), CROWN_POWER_DEFAULT)
+
 
 def _trade_points(value, is_percent, weight):
     """Profit-equivalent points a modifier awards: its size (per 1% for percent, per +1 for flat) x weight."""
     return (value * 100 if is_percent else value) * weight
+
+
+def _effective_value(key, value):
+    """Scoring value for a modifier.  Reductive efficiencies (export/import) cut the price paid, so value
+    is worth value / (1 - value): 90% -> pay 10%, 95% -> pay 5%.  Clamped below 100% to stay finite."""
+    if key in REDUCTIVE_MODS:
+        value = min(value, 0.99)
+        return value / (1.0 - value)
+    return value
 
 
 def load_data():
@@ -4829,151 +4857,201 @@ def build_vassal_breakeven(wb):
 
 
 def build_annex_batching(wb):
-    """Optimal number of concurrent subject annexations by base speed.
+    """Ideal subject size and concurrent count for annexation, given the new cost.
 
-    Each concurrent annexation adds MULTIPLE_ANNEX_PENALTY (-0.5) to speed.
-    Throughput = N × (S − 0.5N).  Optimal N (continuous) = S.
+    Annexing a subject fills a progress bar of ANNEX_BASE_COST + ANNEX_COST_PER_LOCATION
+    per location, at a monthly speed cut by MULTIPLE_ANNEX_PENALTY per extra concurrent
+    annexation. Splitting one territory into more concurrent subjects pays the 200 base
+    once per subject but runs them in parallel, so the best split minimizes total years.
     """
     ws = wb.create_sheet("Annexation Batching")
 
-    PENALTY = 0.5  # |MULTIPLE_ANNEX_PENALTY|
+    ANNEX_BASE = 200      # ANNEX_BASE_COST: loading_screen/common/defines/00_defines.txt:199
+    ANNEX_PER_LOC = 10.0  # ANNEX_COST_PER_LOCATION: loading_screen/common/defines/00_defines.txt:200
+    PENALTY = 0.5         # |MULTIPLE_ANNEX_PENALTY|: loading_screen/common/defines/00_defines.txt:2001
 
+    YR_FMT = "0.0"
     GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 
-    def eff_speed(s, n):
-        """Speed per annexation with n concurrent at base speed s."""
-        return max(0.0, s - PENALTY * n)
+    def years(T, bonus, n, base=1.0):
+        """Years to annex a T-location territory as n equal concurrent subjects."""
+        speed = base * (1 + bonus - PENALTY * (n - 1))
+        if speed <= 0:
+            return None
+        cost = ANNEX_BASE + ANNEX_PER_LOC * (T / n)
+        return (cost / speed) / 12.0
 
-    def tp(s, n):
-        """Total throughput with n concurrent at base speed s."""
-        return n * eff_speed(s, n)
+    def best_n(T, bonus, base=1.0):
+        """Integer n minimizing years (lower n wins ties)."""
+        b_n, b_y = 1, years(T, bonus, 1, base)
+        n = 2
+        while True:
+            y = years(T, bonus, n, base)
+            if y is None:
+                break
+            if y < b_y - 1e-9:
+                b_n, b_y = n, y
+            n += 1
+        return b_n, b_y
 
-    def best_n(s):
-        """Integer N maximising throughput (lower N wins ties)."""
-        n_lo = max(1, int(s))
-        n_hi = n_lo + 1
-        return n_hi if tp(s, n_hi) > tp(s, n_lo) else n_lo
+    TERRITORIES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    BONUSES = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0]
+    bonus_hdr = ["+{}%".format(int(b * 100)) for b in BONUSES]
 
-    def best_ns(s):
-        """Set of equally-optimal integer N values."""
-        n_lo = max(1, int(s))
-        n_hi = n_lo + 1
-        t_lo, t_hi = tp(s, n_lo), tp(s, n_hi)
-        if t_hi > 0 and abs(t_hi - t_lo) < 0.001:
-            return {n_lo, n_hi}
-        return {n_hi} if t_hi > t_lo else {n_lo}
+    def write_matrix(start_row, label, cell_fn, caption=None):
+        """Render a [cost/locations rows x bonus cols] matrix; return the next free row."""
+        r = start_row
+        ws.cell(row=r, column=1, value=label).font = SUBTITLE_FONT
+        r += 1
+        if caption:
+            ws.cell(row=r, column=1, value=caption).font = Font(
+                italic=True, size=10, color="808080")
+            r += 1
+        ws.cell(row=r, column=1, value="Cost")
+        ws.cell(row=r, column=2, value="Locations")
+        for j, h in enumerate(bonus_hdr, 3):
+            ws.cell(row=r, column=j, value=h).alignment = Alignment(
+                horizontal="center")
+        style_header_row(ws, r, len(BONUSES) + 2)
+        r += 1
+        for T in TERRITORIES:
+            c_cost = ws.cell(row=r, column=1, value=round(ANNEX_PER_LOC * T))
+            c_cost.border = THIN_BORDER
+            c_cost.number_format = "#,##0"
+            ws.cell(row=r, column=2, value=T).border = THIN_BORDER
+            for j, bonus in enumerate(BONUSES, 3):
+                val, fmt, fill = cell_fn(T, bonus)
+                cell = ws.cell(row=r, column=j, value=val)
+                cell.border = THIN_BORDER
+                cell.number_format = fmt
+                cell.alignment = Alignment(horizontal="center")
+                if fill:
+                    cell.fill = fill
+            r += 1
+        return r + 1
 
     row = 1
 
     # ===== Title =====
     ws.cell(row=row, column=1,
-            value="Optimal Concurrent Annexation Count").font = TITLE_FONT
+            value="Annexation: Ideal Subject Size and Concurrent Count"
+            ).font = TITLE_FONT
     row += 2
 
     # ===== Notes =====
     notes = [
-        "Each concurrent annexation applies MULTIPLE_ANNEX_PENALTY = \u22120.5 "
-        "(\u221250%) to annexation speed.",
-        "Effective speed per annexation = Base Speed \u2212 50% \u00d7 N, where "
-        "N = number of concurrent annexations.",
-        "Throughput = N \u00d7 Effective Speed.  Optimal N \u2248 Base Speed "
-        "(as a multiplier, e.g. 5 at 500%).",
-        "At the optimal, each annexation runs at half the base speed "
-        "and total throughput = Base Speed\u00b2 \u00f7 2.",
-        "MAX_ANNEX_SIZE = 2 caps something else (not concurrent count).",
+        "Annexing a subject costs 200 + 10 per location of annexation progress; "
+        "the 200 base applies to each subject, it is not divided.",
+        "Progress per month = base speed x (1 + your annex-speed bonus - 0.5 x "
+        "(concurrent - 1)). A single annexation has no penalty.",
+        "Time to annex = cost / monthly progress. Base speed is 1 for a vassal "
+        "(samanta 2, etc.) and only scales the years, not the best count.",
+        "Splitting one territory into more concurrent subjects pays 200 extra per "
+        "subject but runs them in parallel, so the best split minimizes total years.",
+        "More annex-speed bonus and more territory cost both raise the best "
+        "concurrent count; the flat 200 base keeps small or low-bonus cases at 1.",
+        "Cost is a flat 10 per location at any rank; towns and cities instead slow "
+        "integration, so demote them and treat every location as rural (done here).",
     ]
     for note in notes:
         ws.cell(row=row, column=1, value=note).font = Font(italic=True, size=10)
         row += 1
     ws.cell(row=row, column=1,
-            value="Source: loading_screen/common/defines/00_defines.txt"
+            value="Source: loading_screen/common/defines/00_defines.txt:199-200, 2001"
             ).font = Font(italic=True, color="808080")
     row += 2
 
-    # ===== Section 1: Quick Reference =====
-    ws.cell(row=row, column=1,
-            value="Optimal Count by Base Speed").font = SUBTITLE_FONT
+    # ===== Section 1: Constants =====
+    ws.cell(row=row, column=1, value="Game Constants").font = SUBTITLE_FONT
     row += 1
-    ws.cell(row=row, column=1,
-            value="When two N values give equal throughput, the lower is shown "
-            "(faster per-subject completion)."
-            ).font = Font(italic=True, size=10, color="808080")
+    c_hdr = ["Define", "Value", "Source (00_defines.txt)"]
+    for i, h in enumerate(c_hdr, 1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(c_hdr))
     row += 1
-
-    q_headers = ["Base Speed", "Optimal N", "Speed per\nAnnexation",
-                  "Total\nThroughput", "Speed-Up\nvs N=1"]
-    for i, h in enumerate(q_headers, 1):
-        c = ws.cell(row=row, column=i, value=h)
-        c.alignment = Alignment(wrap_text=True, horizontal="center",
-                                vertical="center")
-    style_header_row(ws, row, len(q_headers))
-    row += 1
-
-    speeds_qr = [s / 2 for s in range(2, 31)]  # 1.0 to 15.0, step 0.5
-
-    for S in speeds_qr:
-        n_opt = best_n(S)
-        spd = eff_speed(S, n_opt)
-        t_opt = tp(S, n_opt)
-        t_1 = tp(S, 1)
-        ratio = t_opt / t_1 if t_1 > 0 else 0
-
-        vals = [S, n_opt, spd, t_opt, ratio]
-        fmts = [NUM_FMT_PCT, "0", NUM_FMT_PCT, NUM_FMT_2, '0.00"x"']
-        for i, (v, fmt) in enumerate(zip(vals, fmts), 1):
-            cell = ws.cell(row=row, column=i, value=v)
-            cell.border = THIN_BORDER
-            cell.number_format = fmt
-            if i >= 2:
-                cell.alignment = Alignment(horizontal="center")
+    for name, val, src in [("ANNEX_BASE_COST", 200, "line 199"),
+                           ("ANNEX_COST_PER_LOCATION", 10, "line 200"),
+                           ("MULTIPLE_ANNEX_PENALTY", -0.5, "line 2001")]:
+        ws.cell(row=row, column=1, value=name).border = THIN_BORDER
+        ws.cell(row=row, column=2, value=val).border = THIN_BORDER
+        ws.cell(row=row, column=3, value=src).border = THIN_BORDER
         row += 1
-
-    # ===== Section 2: Throughput Matrix =====
-    row += 2
-    ws.cell(row=row, column=1,
-            value="Throughput Matrix").font = SUBTITLE_FONT
-    row += 1
-    ws.cell(row=row, column=1,
-            value="Total annexation progress per month across all concurrent "
-            "annexations.  Green = optimal for that base speed."
-            ).font = Font(italic=True, size=10)
     row += 1
 
-    max_n = 15
-    matrix_speeds = [float(s) for s in range(1, 16)]
+    # ===== Section 2: Optimal concurrent count =====
+    def cell_count(T, bonus):
+        n, _ = best_n(T, bonus)
+        return n, "0", (GREEN if n >= 2 else None)
+    row = write_matrix(
+        row, "Optimal Concurrent Count (subjects to annex at once)", cell_count,
+        "Green = splitting into 2+ concurrent annexations beats annexing it whole.")
 
-    # Label above header
-    ws.cell(row=row, column=2,
-            value="Concurrent Annexations \u2192").font = Font(
+    # ===== Section 3: Ideal subject size =====
+    def cell_size(T, bonus):
+        n, _ = best_n(T, bonus)
+        return round(T / n), "0", None
+    row = write_matrix(
+        row, "Ideal Subject Size (locations per subject)", cell_size,
+        "Territory / optimal count. Cost per subject = 200 + 10 x locations; "
+        "land per subject excluding the base = 10 x locations.")
+
+    # ===== Section 4: Years at the optimum =====
+    def cell_years(T, bonus):
+        _, y = best_n(T, bonus)
+        return round(y, 1), YR_FMT, None
+    row = write_matrix(
+        row, "Years to Fully Annex at the Optimum", cell_years,
+        "Total years to absorb the whole territory using the optimal split.")
+
+    # ===== Section 5: Worked example (200-location territory) =====
+    ws.cell(row=row, column=1,
+            value="Worked Example: 1,000-Cost Territory (100 locations)"
+            ).font = SUBTITLE_FONT
+    row += 1
+    ws.cell(row=row, column=1,
+            value="Years by concurrent count (lowest in each row highlighted). Size "
+            "and cost columns are per subject at the optimum.").font = Font(
                 italic=True, size=10, color="808080")
     row += 1
 
-    # Header row
-    ws.cell(row=row, column=1, value="Base Speed")
-    for n in range(1, max_n + 1):
-        ws.cell(row=row, column=n + 1, value=n)
-    style_header_row(ws, row, max_n + 1)
+    T0 = 100
+    MAX_N = 6
+    ex_hdr = (["Annex Speed\nBonus", "Optimal\nN", "Locations\n/ Subject",
+               "Cost / Subject\n(incl. base)", "Land / Subject\n(excl. base)"]
+              + ["Years\nN={}".format(n) for n in range(1, MAX_N + 1)])
+    for i, h in enumerate(ex_hdr, 1):
+        ws.cell(row=row, column=i, value=h).alignment = Alignment(
+            wrap_text=True, horizontal="center", vertical="center")
+    style_header_row(ws, row, len(ex_hdr))
     row += 1
 
-    for S in matrix_speeds:
-        cell = ws.cell(row=row, column=1, value=S)
-        cell.number_format = NUM_FMT_PCT
-        cell.border = THIN_BORDER
+    for bonus in BONUSES:
+        n_opt, _ = best_n(T0, bonus)
+        loc = T0 / n_opt
+        yvals = [years(T0, bonus, n) for n in range(1, MAX_N + 1)]
+        best_y = min(y for y in yvals if y is not None)
 
-        opt_set = best_ns(S)
-
-        for n in range(1, max_n + 1):
-            spd = eff_speed(S, n)
-            cell = ws.cell(row=row, column=n + 1)
+        head = [("+{}%".format(int(bonus * 100)), None), (n_opt, "0"),
+                (round(loc), "0"), (round(ANNEX_BASE + ANNEX_PER_LOC * loc), "#,##0"),
+                (round(ANNEX_PER_LOC * loc), "#,##0")]
+        for i, (v, fmt) in enumerate(head, 1):
+            cell = ws.cell(row=row, column=i, value=v)
             cell.border = THIN_BORDER
-            if spd <= 0:
-                cell.value = "\u2014"
+            if fmt:
+                cell.number_format = fmt
+            if i >= 2:
                 cell.alignment = Alignment(horizontal="center")
+        for k, y in enumerate(yvals, 6):
+            cell = ws.cell(row=row, column=k)
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(horizontal="center")
+            if y is None:
+                cell.value = "-"
                 cell.font = Font(color="C0C0C0")
             else:
-                cell.value = round(tp(S, n), 2)
-                cell.number_format = NUM_FMT_2
-                if n in opt_set:
+                cell.value = round(y, 1)
+                cell.number_format = YR_FMT
+                if abs(y - best_y) < 1e-9:
                     cell.fill = GREEN
         row += 1
 
@@ -5165,10 +5243,22 @@ def build_pop_demands(wb, pop_demands):
     auto_width(ws)
 
 
-def _score_mods(mods):
-    """Weighted profit-equivalent score of a modifier dict (per-point weights from TRADE_MOD_COLUMNS)."""
-    return sum(_trade_points(mods[k], is_pct, w)
-               for k, _, is_pct, w in TRADE_MOD_COLUMNS if mods.get(k) and w)
+def _score_mods(mods, income_baseline):
+    """Trade score: percent modifiers compound multiplicatively, flat modifiers add linearly.  trade_income
+    is share-based (1 + value / crown power); export/import efficiency are reductive (see _effective_value)."""
+    mult, flat = 1.0, 0.0
+    for k, _, is_pct, w in TRADE_MOD_COLUMNS:
+        v = mods.get(k)
+        if k == "trade_income":
+            if v:
+                mult *= 1.0 + v / income_baseline
+        elif v and w:
+            ev = _effective_value(k, v)
+            if is_pct:
+                mult *= 1.0 + _trade_points(ev, True, w) / 100.0
+            else:
+                flat += _trade_points(ev, False, w)
+    return (mult - 1.0) * 100.0 + flat
 
 
 # Reformed religions a Catholic nation can adopt: Lutheran/Calvinist/Waldensian anywhere, Anglican and
@@ -5202,10 +5292,17 @@ def _effective_rows(trade_nations, trade_gov_types, gov):
             reach.setdefault(ft, []).append((fmods, fi.get("gov")))
 
     def with_bundle(mods, gt):
+        gt = GOV_ALIAS.get(gt, gt)
         if not gt or gt not in bonuses:
             return mods
         out = dict(mods)
         for k, v in bonuses[gt]["mods"].items():
+            out[k] = out.get(k, 0.0) + v
+        return out
+
+    def with_religion(base, rc):
+        out = dict(base)
+        for k, v in religion_bonuses.get(rc, {}).get("mods", {}).items():
             out[k] = out.get(k, 0.0) + v
         return out
 
@@ -5219,6 +5316,7 @@ def _effective_rows(trade_nations, trade_gov_types, gov):
             for k, v in fmods.items():
                 mods[k] = mods.get(k, 0.0) + v
         gt, rel = None, None
+        income_baseline = INCOME_BASELINE_SWAP
         if gov:
             cand = set()
             if by_tag.get(tag):
@@ -5230,26 +5328,26 @@ def _effective_rows(trade_nations, trade_gov_types, gov):
                 cand.add(formables[tag]["gov"])      # standalone formable uses its natural type
             best = None
             for g in cand:
-                s = _score_mods(with_bundle(mods, g))
+                s = _score_mods(with_bundle(mods, g), _crown_power(g))
                 if best is None or s > best[0]:
                     best = (s, g)
             if best:
                 gt, mods = best[1], with_bundle(mods, best[1])
+            income_baseline = _crown_power(gt)
             own_rel = by_religion.get(tag)
             if own_rel:
                 rcand = {own_rel}
                 if own_rel == "catholic":
                     rcand |= REFORMED_UNIVERSAL | REFORMED_BY_TAG.get(tag, set())
-                rel, best_s = own_rel, _score_mods(religion_bonuses.get(own_rel, {}).get("mods", {}))
+                rel, best_s = own_rel, _score_mods(with_religion(mods, own_rel), income_baseline)
                 for rc in rcand:
-                    s = _score_mods(religion_bonuses.get(rc, {}).get("mods", {}))
+                    s = _score_mods(with_religion(mods, rc), income_baseline)
                     if s > best_s:        # only switch faith if a reformed option scores strictly higher
                         best_s, rel = s, rc
-                mods = dict(mods)
-                for k, v in religion_bonuses.get(rel, {}).get("mods", {}).items():
-                    mods[k] = mods.get(k, 0.0) + v
+                mods = with_religion(mods, rel)
         rows.append({"tag": tag, "name": info.get("name", tag), "mods": mods,
-                     "gov": gt, "religion": rel, "sources": len(info.get("entries", []))})
+                     "gov": gt, "religion": rel, "income_baseline": income_baseline,
+                     "sources": len(info.get("entries", []))})
     return rows
 
 
@@ -5264,7 +5362,7 @@ def build_best_trade_nations(wb, trade_nations, trade_gov_types, gov=False):
 
     rows = _effective_rows(trade_nations, trade_gov_types, gov)
     for r in rows:
-        r["score"] = _score_mods(r["mods"])
+        r["score"] = _score_mods(r["mods"], r["income_baseline"])
     rows.sort(key=lambda r: (r["score"], r["sources"]), reverse=True)
 
     active_cols = [c for c in TRADE_MOD_COLUMNS if any(r["mods"].get(c[0]) for r in rows)]
@@ -5279,11 +5377,26 @@ def build_best_trade_nations(wb, trade_nations, trade_gov_types, gov=False):
     ws.cell(row=row, column=1, value=sub).font = SUBTITLE_FONT
     row += 1
     ws.cell(row=row, column=1,
-            value="Weighted Score sums each modifier x its per-point weight (shown in the Weight row). "
-            "Weights come from in-game trade-tooltip analysis (selling outranks export/import outranks "
-            "merchant maintenance per point); trade-efficiency modifiers are scaled by the route fraction "
-            "they affect; trade income and merchant capacity count flat; dead modifiers are 0."
+            value="Weighted Score compounds each percentage modifier multiplicatively as a 1 + value x weight "
+            "multiplier on trade income (so +25% and +25% give +56%, not +50%), then adds flat modifiers "
+            "linearly.  Weights (shown in the Weight row) come from in-game trade-tooltip analysis; "
+            "trade-efficiency modifiers are scaled by the route fraction they affect; dead modifiers are 0.  "
+            "Export and import efficiency are reductive (they cut the price you pay), so each point is worth "
+            "more the more you stack (value counts as value / (1 - value))."
             ).font = Font(italic=True, color="808080", size=10)
+    row += 1
+    ti = ("Trade income is scored differently: it buys a share of each trade's profit, so it counts as "
+          "1 + value / crown power.  You always sit below a 100% share, so each point is worth far more than "
+          "its face value, making it the rarest and strongest trade modifier.")
+    if gov:
+        ti += ("  Crown power is assumed per government type and shown beside it (republic 25%, monarchy 35%, "
+               "theocracy 30%, others 35%): a hidden 25% base plus +10% monarchy / +5% theocracy for crown "
+               "power the game files do not expose.  Merchant republic's +25% therefore gives republics about "
+               "+100% trade income.")
+    else:
+        ti += ("  Crown power here is a hidden 50% (every nation is assumed to take the merchant republic "
+               "reform), so only a nation's own trade income is shown and scored.")
+    ws.cell(row=row, column=1, value=ti).font = Font(italic=True, color="808080", size=10)
     row += 1
     note = ("Approximate: a modifier's real value scales inversely with a trade's profit margin, so "
             "read the score as a relative ranking, not a literal profit gain.  Raw modifier values are shown "
@@ -5309,11 +5422,12 @@ def build_best_trade_nations(wb, trade_nations, trade_gov_types, gov=False):
     wt_font = Font(italic=True, size=9, color="808080")
     c = ws.cell(row=row, column=2, value="Weight / point"); c.font = wt_font
     c.alignment = Alignment(horizontal="right")
-    for i, (_, _, _, w) in enumerate(active_cols):
-        c = ws.cell(row=row, column=lead + 1 + i, value=w)
+    for i, (key, _, _, w) in enumerate(active_cols):
+        c = ws.cell(row=row, column=lead + 1 + i, value=("/crown" if key == "trade_income" else w))
         c.font = wt_font
         c.alignment = Alignment(horizontal="center")
-        c.number_format = "0.##"
+        if key != "trade_income":
+            c.number_format = "0.##"
     row += 1
     data_start = row
 
@@ -5326,7 +5440,8 @@ def build_best_trade_nations(wb, trade_nations, trade_gov_types, gov=False):
         c = ws.cell(row=row, column=col, value=r["tag"]); c.border = THIN_BORDER; c.alignment = center; col += 1
         if gov:
             gt = r["gov"]
-            c = ws.cell(row=row, column=col, value=(gt.replace("_", " ").title() if gt else None))
+            gt_label = f"{gt.replace('_', ' ').title()} ({r['income_baseline']:.0%})" if gt else None
+            c = ws.cell(row=row, column=col, value=gt_label)
             c.border = THIN_BORDER; c.alignment = center; col += 1
             rel = r.get("religion")
             c = ws.cell(row=row, column=col, value=(rel.replace("_", " ").title() if rel else None))
@@ -5369,12 +5484,19 @@ def build_best_trade_nations_points(wb, trade_nations, trade_gov_types, gov=Fals
 
     rows = []
     for r in _effective_rows(trade_nations, trade_gov_types, gov):
-        pts = {k: _trade_points(r["mods"][k], is_pct, w)
-               for k, _, is_pct, w in scored_cols if r["mods"].get(k)}
+        pts = {}
+        for k, _, is_pct, w in scored_cols:
+            v = r["mods"].get(k)
+            if not v:
+                continue
+            if k == "trade_income":
+                pts[k] = v / r["income_baseline"] * 100.0
+            else:
+                pts[k] = _trade_points(_effective_value(k, v), is_pct, w)
         if not pts:
             continue
         r["pts"] = pts
-        r["score"] = sum(pts.values())
+        r["score"] = _score_mods(r["mods"], r["income_baseline"])
         rows.append(r)
     rows.sort(key=lambda r: (r["score"], r["sources"]), reverse=True)
 
@@ -5392,8 +5514,11 @@ def build_best_trade_nations_points(wb, trade_nations, trade_gov_types, gov=Fals
     row += 1
     ws.cell(row=row, column=1,
             value="Each modifier cell reads value (points), where points = value x the per-point weight "
-            "under the modifier name.  Percent modifiers score per 1%, flat ones per +1 point.  Weighted "
-            "Score is the row total; nations with only dead modifiers are omitted."
+            "(shown in the Weight row).  Percent modifiers score per 1%, flat ones per +1 point.  Trade "
+            "income is share-based: its Weight cell reads /crown and points = value / crown power x 100 "
+            "(crown power is shown in the Gov Type column, or a hidden 50% on the plain sheet).  Weighted "
+            "Score compounds the percent points multiplicatively and adds the flat points, so it will not "
+            "equal the sum of the cells; nations with only dead modifiers are omitted."
             ).font = Font(italic=True, color="808080", size=10)
     row += 1
     ws.cell(row=row, column=1,
@@ -5402,12 +5527,24 @@ def build_best_trade_nations_points(wb, trade_nations, trade_gov_types, gov=Fals
     row += 2
 
     headers = (["Rank", "Nation", "Tag"] + (["Gov Type", "Religion"] if gov else [])
-               + [f"{label}\nx{w:g}" for _, label, _, w in active_cols]
+               + [label for _, label, _, _ in active_cols]
                + ["Weighted Score", "Sources"])
     header_row = row
     for i, h in enumerate(headers, 1):
         ws.cell(row=header_row, column=i, value=h)
     style_header_row(ws, header_row, len(headers))
+    row += 1
+
+    # Per-point weight for each modifier column, kept beside the data it scales.
+    wt_font = Font(italic=True, size=9, color="808080")
+    c = ws.cell(row=row, column=2, value="Weight / point"); c.font = wt_font
+    c.alignment = Alignment(horizontal="right")
+    for i, (key, _, _, w) in enumerate(active_cols):
+        c = ws.cell(row=row, column=lead + 1 + i, value=("/crown" if key == "trade_income" else w))
+        c.font = wt_font
+        c.alignment = Alignment(horizontal="center")
+        if key != "trade_income":
+            c.number_format = "0.##"
     row += 1
     data_start = row
 
@@ -5419,7 +5556,8 @@ def build_best_trade_nations_points(wb, trade_nations, trade_gov_types, gov=Fals
         c = ws.cell(row=row, column=col, value=r["tag"]); c.border = THIN_BORDER; c.alignment = center; col += 1
         if gov:
             gt = r["gov"]
-            c = ws.cell(row=row, column=col, value=(gt.replace("_", " ").title() if gt else None))
+            gt_label = f"{gt.replace('_', ' ').title()} ({r['income_baseline']:.0%})" if gt else None
+            c = ws.cell(row=row, column=col, value=gt_label)
             c.border = THIN_BORDER; c.alignment = center; col += 1
             rel = r.get("religion")
             c = ws.cell(row=row, column=col, value=(rel.replace("_", " ").title() if rel else None))
