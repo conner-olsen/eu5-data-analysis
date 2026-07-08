@@ -4894,8 +4894,8 @@ def build_annex_batching(wb):
             n += 1
         return b_n, b_y
 
-    TERRITORIES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-    BONUSES = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0]
+    TERRITORIES = [10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100]
+    BONUSES = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
     bonus_hdr = ["+{}%".format(int(b * 100)) for b in BONUSES]
 
     def write_matrix(start_row, label, cell_fn, caption=None):
