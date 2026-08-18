@@ -190,9 +190,9 @@ def loc(internal_name: str) -> str:
     return LOC.get(internal_name, internal_name)
 
 
-def style_header_row(ws, row, num_cols):
+def style_header_row(ws, row, num_cols, start_col=1):
     """Style a header row with blue background and white bold text."""
-    for col in range(1, num_cols + 1):
+    for col in range(start_col, start_col + num_cols):
         cell = ws.cell(row=row, column=col)
         cell.font = HEADER_FONT_WHITE
         cell.fill = HEADER_FILL
@@ -2575,6 +2575,17 @@ def build_navy(wb, naval_units, categories):
 
 WATER_TYPES = ["deep_ocean", "ocean", "inland_sea", "narrows"]
 
+# Maritime presence is a per-coastal-sea-zone 0-100 value (loading_screen/common/defines/00_defines.txt:1929,
+# PATROL_THE_SEAS_THRESHOLD comment "(0-100)") decaying 0.5% of current each month
+# (global_maritime_presence_decay = 0.005: in_game/common/auto_modifiers/country.txt:25), so at the 100
+# cap it loses 0.5/month. A fleet's base presence is scaled by (1 + maritime presence modifier) and split
+# evenly among its sea province's coastal zones, so holding every zone at the cap needs
+# base = 0.5 * coastal_zones / (1 + modifier); per coastal location at baseline that is 0.5, so
+# ships/location = 0.5 / maritime_presence_per_ship.
+MARITIME_PRESENCE_MAX = 100
+MARITIME_PRESENCE_DECAY_RATE = 0.005
+MARITIME_DECAY_AT_MAX = MARITIME_PRESENCE_MAX * MARITIME_PRESENCE_DECAY_RATE
+
 
 def _all_naval_up_to_age(naval_units, age):
     """Get all buildable generic naval units available up to and including the given age."""
@@ -2598,10 +2609,15 @@ def build_maritime_per_sailor(wb, naval_units, categories, prices):
     ws.cell(row=2, column=1,
             value="All ships available up to each age. Best = most presence per sailor. "
                   "Crew = sailors per ship.").font = Font(italic=True)
+    ws.cell(row=3, column=1,
+            value="Ships/Loc (Max) = ships to hold one coastal sea zone at max presence (100) at "
+                  "baseline (no modifier). A whole sea province needs this times its coastal-zone count, "
+                  "divided by (1 + your maritime presence modifier). See the Maritime Presence Needed "
+                  "sheet.").font = Font(italic=True)
 
     headers = [
         "Available At", "Category", "Unit", "Ship Age",
-        "MP/Sailor", "Maritime Presence", "Crew (Sailors)",
+        "MP/Sailor", "Maritime Presence", "Ships/Loc (Max)", "Crew (Sailors)",
         "Gold Cost",
     ]
     header_row = 4
@@ -2631,13 +2647,14 @@ def build_maritime_per_sailor(wb, naval_units, categories, prices):
             mp = u.get("maritime_presence", 0) or 0
             crew = u.get("crew_size", cat_data.get("crew_size", 0)) or 0
             mp_per_sailor = mp / crew if crew > 0 else 0
+            ships_per_loc = MARITIME_DECAY_AT_MAX / mp if mp > 0 else ""
             cost = calc_cost(u.get("max_strength", 1.0), cat, prices, u["name"])
 
             values = [
                 AGE_LABELS.get(age, "?"),
                 cat_label, loc(u["name"]),
                 AGE_LABELS.get(u.get("age", ""), "?"),
-                mp_per_sailor, mp, crew,
+                mp_per_sailor, mp, ships_per_loc, crew,
                 cost,
             ]
             for j, v in enumerate(values, 1):
@@ -2666,10 +2683,15 @@ def build_maritime_per_gold(wb, naval_units, categories, prices):
     ws.cell(row=1, column=1, value="Maritime Presence per Gold").font = TITLE_FONT
     ws.cell(row=2, column=1,
             value="All ships available up to each age. Best = most presence per gold spent.").font = Font(italic=True)
+    ws.cell(row=3, column=1,
+            value="Ships/Loc (Max) = ships to hold one coastal sea zone at max presence (100) at "
+                  "baseline (no modifier). A whole sea province needs this times its coastal-zone count, "
+                  "divided by (1 + your maritime presence modifier). See the Maritime Presence Needed "
+                  "sheet.").font = Font(italic=True)
 
     headers = [
         "Available At", "Category", "Unit", "Ship Age",
-        "MP/Gold", "Maritime Presence", "Gold Cost",
+        "MP/Gold", "Maritime Presence", "Ships/Loc (Max)", "Gold Cost",
         "Crew (Sailors)",
     ]
     header_row = 4
@@ -2701,12 +2723,13 @@ def build_maritime_per_gold(wb, naval_units, categories, prices):
             crew = u.get("crew_size", cat_data.get("crew_size", 0)) or 0
             cost = calc_cost(u.get("max_strength", 1.0), cat, prices, u["name"])
             mp_per_gold = mp / cost * 100 if cost > 0 else 0
+            ships_per_loc = MARITIME_DECAY_AT_MAX / mp if mp > 0 else ""
 
             values = [
                 AGE_LABELS.get(age, "?"),
                 cat_label, loc(u["name"]),
                 AGE_LABELS.get(u.get("age", ""), "?"),
-                mp_per_gold, mp, cost,
+                mp_per_gold, mp, ships_per_loc, cost,
                 crew,
             ]
             for j, v in enumerate(values, 1):
@@ -2726,6 +2749,52 @@ def build_maritime_per_gold(wb, naval_units, categories, prices):
     highlight_best_in_age_by_cat(ws, tracked_rows, HIGHLIGHT_COLS)
     auto_width(ws, max_width=35)
     ws.freeze_panes = f"A{header_row + 1}"
+
+
+# Matrix axes. 150% modifier ceiling spans realistic stacking (navy tradition, advances, laws,
+# religion, societal values, admirals).
+MP_MODIFIER_STEPS = [i / 100 for i in range(0, 160, 10)]
+MP_ZONE_COUNTS = list(range(1, 13))
+
+
+def build_maritime_presence_needed(wb):
+    """Sheet: base maritime presence a fleet must supply to hold max (100), by province coastal-zone
+    count and maritime presence modifier."""
+    ws = wb.create_sheet("Maritime Presence Needed")
+
+    ws.cell(row=1, column=1, value="Maritime Presence Needed for Max Presence (100)").font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value="Each coastal sea zone in a fleet's sea province gains (fleet base presence) x "
+                  "(1 + modifier) / (coastal zones) per month; decay at the cap is 0.5/month. Cells = "
+                  "fleet base maritime presence (the raw sum shown on the fleet) needed to hold every "
+                  "coastal zone at max.").font = Font(italic=True)
+    ws.cell(row=3, column=1,
+            value="Columns = coastal sea zones in the province (1 = per location). Rows = your maritime "
+                  "presence modifier. Divide a cell by a ship's Maritime Presence to get the ship "
+                  "count.").font = Font(italic=True)
+
+    header_row = 5
+    ncols = 1 + len(MP_ZONE_COUNTS)
+    ws.cell(row=header_row, column=1, value="MP Modifier")
+    for j, zones in enumerate(MP_ZONE_COUNTS, start=2):
+        ws.cell(row=header_row, column=j, value=f"{zones} (per loc)" if zones == 1 else str(zones))
+    style_header_row(ws, header_row, ncols)
+
+    row = header_row + 1
+    for mod in MP_MODIFIER_STEPS:
+        mcell = ws.cell(row=row, column=1, value=mod)
+        mcell.number_format = NUM_FMT_PCT
+        mcell.font = BEST_FONT
+        mcell.border = THIN_BORDER
+        for j, zones in enumerate(MP_ZONE_COUNTS, start=2):
+            cell = ws.cell(row=row, column=j, value=MARITIME_DECAY_AT_MAX * zones / (1 + mod))
+            cell.number_format = NUM_FMT_2
+            cell.border = THIN_BORDER
+        row += 1
+
+    auto_width(ws)
+    ws.column_dimensions["A"].width = 14
+    ws.freeze_panes = f"B{header_row + 1}"
 
 
 def build_navy_unique_terrain(wb, naval_units, categories):
@@ -4857,36 +4926,41 @@ def build_vassal_breakeven(wb):
 
 
 def build_annex_batching(wb):
-    """Ideal subject size and concurrent count for annexation, given the new cost.
+    """Ideal subject size and concurrent count for annexation, at each base cost.
 
     Annexing a subject fills a progress bar of ANNEX_BASE_COST + ANNEX_COST_PER_LOCATION
     per location, at a monthly speed cut by MULTIPLE_ANNEX_PENALTY per extra concurrent
-    annexation. Splitting one territory into more concurrent subjects pays the 200 base
+    annexation. Splitting one territory into more concurrent subjects pays the base cost
     once per subject but runs them in parallel, so the best split minimizes total years.
+    The 1.3 base of 200 and the 1.4 base of 50 sit side by side.
     """
     ws = wb.create_sheet("Annexation Batching")
 
-    ANNEX_BASE = 200      # ANNEX_BASE_COST: loading_screen/common/defines/00_defines.txt:199
-    ANNEX_PER_LOC = 10.0  # ANNEX_COST_PER_LOCATION: loading_screen/common/defines/00_defines.txt:200
-    PENALTY = 0.5         # |MULTIPLE_ANNEX_PENALTY|: loading_screen/common/defines/00_defines.txt:2001
+    BASE_1_3 = 200        # ANNEX_BASE_COST: loading_screen/common/defines/00_defines.txt:212
+    BASE_1_4 = 50         # ANNEX_BASE_COST in 1.4
+    ANNEX_PER_LOC = 10.0  # ANNEX_COST_PER_LOCATION: loading_screen/common/defines/00_defines.txt:213
+    PENALTY = 0.5         # |MULTIPLE_ANNEX_PENALTY|: loading_screen/common/defines/00_defines.txt:2017
+
+    BLOCK_WIDTH = 13      # widest section: 5 label columns + one per concurrent count
+    RIGHT_COL = BLOCK_WIDTH + 2
 
     YR_FMT = "0.0"
     GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 
-    def years(T, bonus, n, base=1.0):
+    def years(T, bonus, n, annex_base, base=1.0):
         """Years to annex a T-location territory as n equal concurrent subjects."""
         speed = base * (1 + bonus - PENALTY * (n - 1))
         if speed <= 0:
             return None
-        cost = ANNEX_BASE + ANNEX_PER_LOC * (T / n)
+        cost = annex_base + ANNEX_PER_LOC * (T / n)
         return (cost / speed) / 12.0
 
-    def best_n(T, bonus, base=1.0):
+    def best_n(T, bonus, annex_base, base=1.0):
         """Integer n minimizing years (lower n wins ties)."""
-        b_n, b_y = 1, years(T, bonus, 1, base)
+        b_n, b_y = 1, years(T, bonus, 1, annex_base, base)
         n = 2
         while True:
-            y = years(T, bonus, n, base)
+            y = years(T, bonus, n, annex_base, base)
             if y is None:
                 break
             if y < b_y - 1e-9:
@@ -4894,168 +4968,183 @@ def build_annex_batching(wb):
             n += 1
         return b_n, b_y
 
-    TERRITORIES = [10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100]
+    TERRITORIES = [10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100,
+                   120, 140, 160, 180, 200]
     BONUSES = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
     bonus_hdr = ["+{}%".format(int(b * 100)) for b in BONUSES]
 
-    def write_matrix(start_row, label, cell_fn, caption=None):
-        """Render a [cost/locations rows x bonus cols] matrix; return the next free row."""
-        r = start_row
-        ws.cell(row=r, column=1, value=label).font = SUBTITLE_FONT
-        r += 1
-        if caption:
-            ws.cell(row=r, column=1, value=caption).font = Font(
-                italic=True, size=10, color="808080")
+    def render_block(col0, annex_base, version, base_source, source_line):
+        """Write every section for one base cost, starting at column col0."""
+
+        def write_matrix(start_row, label, cell_fn, caption=None):
+            """Render a [cost/locations rows x bonus cols] matrix; return the next free row."""
+            r = start_row
+            ws.cell(row=r, column=col0, value=label).font = SUBTITLE_FONT
             r += 1
-        ws.cell(row=r, column=1, value="Cost")
-        ws.cell(row=r, column=2, value="Locations")
-        for j, h in enumerate(bonus_hdr, 3):
-            ws.cell(row=r, column=j, value=h).alignment = Alignment(
-                horizontal="center")
-        style_header_row(ws, r, len(BONUSES) + 2)
-        r += 1
-        for T in TERRITORIES:
-            c_cost = ws.cell(row=r, column=1, value=round(ANNEX_PER_LOC * T))
-            c_cost.border = THIN_BORDER
-            c_cost.number_format = "#,##0"
-            ws.cell(row=r, column=2, value=T).border = THIN_BORDER
-            for j, bonus in enumerate(BONUSES, 3):
-                val, fmt, fill = cell_fn(T, bonus)
-                cell = ws.cell(row=r, column=j, value=val)
+            if caption:
+                ws.cell(row=r, column=col0, value=caption).font = Font(
+                    italic=True, size=10, color="808080")
+                r += 1
+            ws.cell(row=r, column=col0, value="Cost")
+            ws.cell(row=r, column=col0 + 1, value="Locations")
+            for j, h in enumerate(bonus_hdr, col0 + 2):
+                ws.cell(row=r, column=j, value=h).alignment = Alignment(
+                    horizontal="center")
+            style_header_row(ws, r, len(BONUSES) + 2, start_col=col0)
+            r += 1
+            for T in TERRITORIES:
+                c_cost = ws.cell(row=r, column=col0, value=round(ANNEX_PER_LOC * T))
+                c_cost.border = THIN_BORDER
+                c_cost.number_format = "#,##0"
+                ws.cell(row=r, column=col0 + 1, value=T).border = THIN_BORDER
+                for j, bonus in enumerate(BONUSES, col0 + 2):
+                    val, fmt, fill = cell_fn(T, bonus)
+                    cell = ws.cell(row=r, column=j, value=val)
+                    cell.border = THIN_BORDER
+                    cell.number_format = fmt
+                    cell.alignment = Alignment(horizontal="center")
+                    if fill:
+                        cell.fill = fill
+                r += 1
+            return r + 1
+
+        row = 1
+
+        # ===== Title =====
+        ws.cell(row=row, column=col0,
+                value="Annexation: Ideal Subject Size and Concurrent Count - "
+                      "{} Base Cost {}".format(version, annex_base)
+                ).font = TITLE_FONT
+        row += 2
+
+        # ===== Notes =====
+        notes = [
+            "Annexing a subject costs {} + 10 per location of annexation progress; "
+            "the {} base applies to each subject, it is not divided.".format(
+                annex_base, annex_base),
+            "Progress per month = base speed x (1 + your annex-speed bonus - 0.5 x "
+            "(concurrent - 1)). A single annexation has no penalty.",
+            "Time to annex = cost / monthly progress. Base speed is 1 for a vassal "
+            "(samanta 2, etc.) and only scales the years, not the best count.",
+            "Splitting one territory into more concurrent subjects pays {} extra per "
+            "subject but runs them in parallel, so the best split minimizes total "
+            "years.".format(annex_base),
+            "More annex-speed bonus and more territory cost both raise the best "
+            "concurrent count; the flat {} base keeps small or low-bonus cases at "
+            "1.".format(annex_base),
+            "Cost is a flat 10 per location at any rank; towns and cities instead slow "
+            "integration, so demote them and treat every location as rural (done here).",
+        ]
+        for note in notes:
+            ws.cell(row=row, column=col0, value=note).font = Font(italic=True, size=10)
+            row += 1
+        ws.cell(row=row, column=col0, value=source_line).font = Font(
+            italic=True, color="808080")
+        row += 2
+
+        # ===== Section 1: Constants =====
+        ws.cell(row=row, column=col0, value="Game Constants").font = SUBTITLE_FONT
+        row += 1
+        c_hdr = ["Define", "Value", "Source"]
+        for i, h in enumerate(c_hdr, col0):
+            ws.cell(row=row, column=i, value=h)
+        style_header_row(ws, row, len(c_hdr), start_col=col0)
+        row += 1
+        for name, val, src in [("ANNEX_BASE_COST", annex_base, base_source),
+                               ("ANNEX_COST_PER_LOCATION", 10, "00_defines.txt:213"),
+                               ("MULTIPLE_ANNEX_PENALTY", -0.5, "00_defines.txt:2017")]:
+            ws.cell(row=row, column=col0, value=name).border = THIN_BORDER
+            ws.cell(row=row, column=col0 + 1, value=val).border = THIN_BORDER
+            ws.cell(row=row, column=col0 + 2, value=src).border = THIN_BORDER
+            row += 1
+        row += 1
+
+        # ===== Section 2: Optimal concurrent count =====
+        def cell_count(T, bonus):
+            n, _ = best_n(T, bonus, annex_base)
+            return n, "0", (GREEN if n >= 2 else None)
+        row = write_matrix(
+            row, "Optimal Concurrent Count (subjects to annex at once)", cell_count,
+            "Green = splitting into 2+ concurrent annexations beats annexing it whole.")
+
+        # ===== Section 3: Ideal subject size =====
+        def cell_size(T, bonus):
+            n, _ = best_n(T, bonus, annex_base)
+            return round(T / n), "0", None
+        row = write_matrix(
+            row, "Ideal Subject Size (locations per subject)", cell_size,
+            "Territory / optimal count. Cost per subject = {} + 10 x locations; "
+            "land per subject excluding the base = 10 x locations.".format(annex_base))
+
+        # ===== Section 4: Years at the optimum =====
+        def cell_years(T, bonus):
+            _, y = best_n(T, bonus, annex_base)
+            return round(y, 1), YR_FMT, None
+        row = write_matrix(
+            row, "Years to Fully Annex at the Optimum", cell_years,
+            "Total years to absorb the whole territory using the optimal split.")
+
+        # ===== Section 5: Worked example (200-location territory) =====
+        ws.cell(row=row, column=col0,
+                value="Worked Example: 2,000-Cost Territory (200 locations)"
+                ).font = SUBTITLE_FONT
+        row += 1
+        ws.cell(row=row, column=col0,
+                value="Years by concurrent count (lowest in each row highlighted). Size "
+                "and cost columns are per subject at the optimum.").font = Font(
+                    italic=True, size=10, color="808080")
+        row += 1
+
+        T0 = 200
+        MAX_N = 8
+        ex_hdr = (["Annex Speed\nBonus", "Optimal\nN", "Locations\n/ Subject",
+                   "Cost / Subject\n(incl. base)", "Land / Subject\n(excl. base)"]
+                  + ["Years\nN={}".format(n) for n in range(1, MAX_N + 1)])
+        for i, h in enumerate(ex_hdr, col0):
+            ws.cell(row=row, column=i, value=h).alignment = Alignment(
+                wrap_text=True, horizontal="center", vertical="center")
+        style_header_row(ws, row, len(ex_hdr), start_col=col0)
+        row += 1
+
+        for bonus in BONUSES:
+            n_opt, _ = best_n(T0, bonus, annex_base)
+            loc = T0 / n_opt
+            yvals = [years(T0, bonus, n, annex_base) for n in range(1, MAX_N + 1)]
+            best_y = min(y for y in yvals if y is not None)
+
+            head = [("+{}%".format(int(bonus * 100)), None), (n_opt, "0"),
+                    (round(loc), "0"),
+                    (round(annex_base + ANNEX_PER_LOC * loc), "#,##0"),
+                    (round(ANNEX_PER_LOC * loc), "#,##0")]
+            for i, (v, fmt) in enumerate(head, col0):
+                cell = ws.cell(row=row, column=i, value=v)
                 cell.border = THIN_BORDER
-                cell.number_format = fmt
+                if fmt:
+                    cell.number_format = fmt
+                if i >= col0 + 1:
+                    cell.alignment = Alignment(horizontal="center")
+            for k, y in enumerate(yvals, col0 + 5):
+                cell = ws.cell(row=row, column=k)
+                cell.border = THIN_BORDER
                 cell.alignment = Alignment(horizontal="center")
-                if fill:
-                    cell.fill = fill
-            r += 1
-        return r + 1
+                if y is None:
+                    cell.value = "-"
+                    cell.font = Font(color="C0C0C0")
+                else:
+                    cell.value = round(y, 1)
+                    cell.number_format = YR_FMT
+                    if abs(y - best_y) < 1e-9:
+                        cell.fill = GREEN
+            row += 1
 
-    row = 1
-
-    # ===== Title =====
-    ws.cell(row=row, column=1,
-            value="Annexation: Ideal Subject Size and Concurrent Count"
-            ).font = TITLE_FONT
-    row += 2
-
-    # ===== Notes =====
-    notes = [
-        "Annexing a subject costs 200 + 10 per location of annexation progress; "
-        "the 200 base applies to each subject, it is not divided.",
-        "Progress per month = base speed x (1 + your annex-speed bonus - 0.5 x "
-        "(concurrent - 1)). A single annexation has no penalty.",
-        "Time to annex = cost / monthly progress. Base speed is 1 for a vassal "
-        "(samanta 2, etc.) and only scales the years, not the best count.",
-        "Splitting one territory into more concurrent subjects pays 200 extra per "
-        "subject but runs them in parallel, so the best split minimizes total years.",
-        "More annex-speed bonus and more territory cost both raise the best "
-        "concurrent count; the flat 200 base keeps small or low-bonus cases at 1.",
-        "Cost is a flat 10 per location at any rank; towns and cities instead slow "
-        "integration, so demote them and treat every location as rural (done here).",
-    ]
-    for note in notes:
-        ws.cell(row=row, column=1, value=note).font = Font(italic=True, size=10)
-        row += 1
-    ws.cell(row=row, column=1,
-            value="Source: loading_screen/common/defines/00_defines.txt:199-200, 2001"
-            ).font = Font(italic=True, color="808080")
-    row += 2
-
-    # ===== Section 1: Constants =====
-    ws.cell(row=row, column=1, value="Game Constants").font = SUBTITLE_FONT
-    row += 1
-    c_hdr = ["Define", "Value", "Source (00_defines.txt)"]
-    for i, h in enumerate(c_hdr, 1):
-        ws.cell(row=row, column=i, value=h)
-    style_header_row(ws, row, len(c_hdr))
-    row += 1
-    for name, val, src in [("ANNEX_BASE_COST", 200, "line 199"),
-                           ("ANNEX_COST_PER_LOCATION", 10, "line 200"),
-                           ("MULTIPLE_ANNEX_PENALTY", -0.5, "line 2001")]:
-        ws.cell(row=row, column=1, value=name).border = THIN_BORDER
-        ws.cell(row=row, column=2, value=val).border = THIN_BORDER
-        ws.cell(row=row, column=3, value=src).border = THIN_BORDER
-        row += 1
-    row += 1
-
-    # ===== Section 2: Optimal concurrent count =====
-    def cell_count(T, bonus):
-        n, _ = best_n(T, bonus)
-        return n, "0", (GREEN if n >= 2 else None)
-    row = write_matrix(
-        row, "Optimal Concurrent Count (subjects to annex at once)", cell_count,
-        "Green = splitting into 2+ concurrent annexations beats annexing it whole.")
-
-    # ===== Section 3: Ideal subject size =====
-    def cell_size(T, bonus):
-        n, _ = best_n(T, bonus)
-        return round(T / n), "0", None
-    row = write_matrix(
-        row, "Ideal Subject Size (locations per subject)", cell_size,
-        "Territory / optimal count. Cost per subject = 200 + 10 x locations; "
-        "land per subject excluding the base = 10 x locations.")
-
-    # ===== Section 4: Years at the optimum =====
-    def cell_years(T, bonus):
-        _, y = best_n(T, bonus)
-        return round(y, 1), YR_FMT, None
-    row = write_matrix(
-        row, "Years to Fully Annex at the Optimum", cell_years,
-        "Total years to absorb the whole territory using the optimal split.")
-
-    # ===== Section 5: Worked example (200-location territory) =====
-    ws.cell(row=row, column=1,
-            value="Worked Example: 1,000-Cost Territory (100 locations)"
-            ).font = SUBTITLE_FONT
-    row += 1
-    ws.cell(row=row, column=1,
-            value="Years by concurrent count (lowest in each row highlighted). Size "
-            "and cost columns are per subject at the optimum.").font = Font(
-                italic=True, size=10, color="808080")
-    row += 1
-
-    T0 = 100
-    MAX_N = 6
-    ex_hdr = (["Annex Speed\nBonus", "Optimal\nN", "Locations\n/ Subject",
-               "Cost / Subject\n(incl. base)", "Land / Subject\n(excl. base)"]
-              + ["Years\nN={}".format(n) for n in range(1, MAX_N + 1)])
-    for i, h in enumerate(ex_hdr, 1):
-        ws.cell(row=row, column=i, value=h).alignment = Alignment(
-            wrap_text=True, horizontal="center", vertical="center")
-    style_header_row(ws, row, len(ex_hdr))
-    row += 1
-
-    for bonus in BONUSES:
-        n_opt, _ = best_n(T0, bonus)
-        loc = T0 / n_opt
-        yvals = [years(T0, bonus, n) for n in range(1, MAX_N + 1)]
-        best_y = min(y for y in yvals if y is not None)
-
-        head = [("+{}%".format(int(bonus * 100)), None), (n_opt, "0"),
-                (round(loc), "0"), (round(ANNEX_BASE + ANNEX_PER_LOC * loc), "#,##0"),
-                (round(ANNEX_PER_LOC * loc), "#,##0")]
-        for i, (v, fmt) in enumerate(head, 1):
-            cell = ws.cell(row=row, column=i, value=v)
-            cell.border = THIN_BORDER
-            if fmt:
-                cell.number_format = fmt
-            if i >= 2:
-                cell.alignment = Alignment(horizontal="center")
-        for k, y in enumerate(yvals, 6):
-            cell = ws.cell(row=row, column=k)
-            cell.border = THIN_BORDER
-            cell.alignment = Alignment(horizontal="center")
-            if y is None:
-                cell.value = "-"
-                cell.font = Font(color="C0C0C0")
-            else:
-                cell.value = round(y, 1)
-                cell.number_format = YR_FMT
-                if abs(y - best_y) < 1e-9:
-                    cell.fill = GREEN
-        row += 1
+    render_block(1, BASE_1_3, "1.3", "00_defines.txt:212",
+                 "Source: loading_screen/common/defines/00_defines.txt:212-213, 2017")
+    render_block(RIGHT_COL, BASE_1_4, "1.4", "1.4 value",
+                 "Source: loading_screen/common/defines/00_defines.txt:213, 2017; the 50 "
+                 "base is the 1.4 value and is not in the current game files.")
 
     auto_width(ws)
+    ws.column_dimensions[get_column_letter(BLOCK_WIDTH + 1)].width = 3
 
 
 def build_pop_demands(wb, pop_demands):
@@ -5671,6 +5760,9 @@ def main():
 
     print("Building Maritime (Gold) sheet...")
     build_maritime_per_gold(navy_wb, naval_units, categories, prices)
+
+    print("Building Maritime Presence Needed sheet...")
+    build_maritime_presence_needed(navy_wb)
 
     print("Building Navy (Unique) sheet...")
     build_navy_unique(navy_wb, naval_units, categories)
